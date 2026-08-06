@@ -1,4 +1,4 @@
-"""Fetch Senate STOCK Act PTR filings from efts.senate.gov and merge into
+"""Fetch Senate STOCK Act PTR filings from efdsearch.senate.gov and merge into
 aggregate/all_transactions.json in the senate_stock_watcher field format.
 
 Usage:
@@ -6,121 +6,207 @@ Usage:
     python scripts/fetch.py --from 2021-01-01 --to 2021-12-31   # backfill range
 
 Deduplicates on ptr_link (the UUID in the URL is stable across re-fetches).
+
+The Senate eFDS search (efdsearch.senate.gov) is a Django app — we need a
+session cookie + CSRF token before each POST.  efts.senate.gov was decommissioned.
 """
 import argparse
 import json
+import re
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, timedelta
+from http.cookiejar import CookieJar
 from pathlib import Path
 
-_HEADERS = {"User-Agent": "senate-ptr-data/1.0 (github.com/vandijkray/senate-ptr-data)"}
-_EFTS_URL = "https://efts.senate.gov/LATEST/search-results"
-_PAGE_SIZE = 250
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.9",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_HOME_URL    = "https://efdsearch.senate.gov/search/home/"
+_SEARCH_URL  = "https://efdsearch.senate.gov/search/results/"
+_PAGE_SIZE   = 100
 _AGGREGATE_PATH = Path(__file__).parent.parent / "aggregate" / "all_transactions.json"
 
 
-def _efts_fetch_page(from_date: str, to_date: str, start: int) -> dict:
-    params = urllib.parse.urlencode({
-        "q": json.dumps({"source": "ptr"}),
-        "dateRange": "custom",
-        "fromDate": from_date,
-        "toDate": to_date,
-        "limit": _PAGE_SIZE,
+def _make_opener() -> urllib.request.OpenerDirector:
+    jar = CookieJar()
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+
+def _get_csrf(opener: urllib.request.OpenerDirector) -> str:
+    """Fetch the search home page and return the CSRF token."""
+    req = urllib.request.Request(_HOME_URL, headers=_HEADERS)
+    with opener.open(req, timeout=20) as r:
+        body = r.read().decode(errors="replace")
+    m = re.search(r'name="csrfmiddlewaretoken"\s+value="([^"]+)"', body)
+    if not m:
+        # Try alternate quote style
+        m = re.search(r"csrfmiddlewaretoken['\"].*?value=['\"]([^'\"]+)", body)
+    if not m:
+        print("WARNING: could not extract CSRF token — response snippet:", body[:500], file=sys.stderr)
+        return ""
+    return m.group(1)
+
+
+def _search_page(
+    opener: urllib.request.OpenerDirector,
+    csrf: str,
+    from_date: str,
+    to_date: str,
+    start: int,
+) -> tuple[list[dict], int]:
+    """POST one page of PTR search results.  Returns (rows, total)."""
+    # efdsearch uses MM/DD/YYYY in form fields
+    def to_mdy(iso: str) -> str:
+        y, m, d = iso.split("-")
+        return f"{m}/{d}/{y}"
+
+    form = urllib.parse.urlencode({
+        "csrfmiddlewaretoken": csrf,
+        "action": "search",
+        "type[]": "6",          # 6 = Periodic Transaction Report
+        "filer_type": "1",      # 1 = senator
+        "submitted_start_date": to_mdy(from_date),
+        "submitted_end_date":   to_mdy(to_date),
         "start": start,
-    })
-    url = f"{_EFTS_URL}?{params}"
-    req = urllib.request.Request(url, headers=_HEADERS)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+        "length": _PAGE_SIZE,
+    }).encode()
+
+    req = urllib.request.Request(
+        _SEARCH_URL, data=form, method="POST",
+        headers={
+            **_HEADERS,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": _HOME_URL,
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+        },
+    )
+    with opener.open(req, timeout=30) as r:
+        ct = r.headers.get("Content-Type", "")
+        body = r.read()
+
+    if "json" in ct:
+        data = json.loads(body)
+        rows = data.get("data", [])
+        total = data.get("recordsTotal", len(rows))
+        return rows, total
+
+    # Fallback: HTML table parse
+    text = body.decode(errors="replace")
+    # The table has rows like: <td>name</td><td>ticker</td>...
+    # Count entries from "Showing X to Y of Z entries"
+    total_m = re.search(r"of\s+([\d,]+)\s+entries", text)
+    total = int(total_m.group(1).replace(",", "")) if total_m else 0
+    # Extract table rows
+    row_pat = re.compile(r"<tr[^>]*>(.*?)</tr>", re.DOTALL)
+    cell_pat = re.compile(r"<td[^>]*>(.*?)</td>", re.DOTALL)
+    tag_pat  = re.compile(r"<[^>]+>")
+    rows = []
+    for row_m in row_pat.finditer(text):
+        cells = [tag_pat.sub("", c.group(1)).strip()
+                 for c in cell_pat.finditer(row_m.group(1))]
+        if len(cells) >= 4:
+            rows.append(cells)
+    return rows, total
+
+
+def _normalise_json_row(row: dict | list) -> dict | None:
+    """Normalise one row from efdsearch JSON or HTML-table parse."""
+    if isinstance(row, list):
+        # HTML table columns: [first, last, office, type, asset, ticker, tx_type, amount, tx_date, filed_date, ptr_link_html]
+        if len(row) < 10:
+            return None
+        tag = re.compile(r"<[^>]+>")
+        href = re.search(r'href="([^"]+)"', row[-1]) if len(row) > 10 else None
+        ptr_link = ("https://efdsearch.senate.gov" + href.group(1)) if href else ""
+        return {
+            "transaction_date": row[8].strip(),
+            "owner": "self",
+            "ticker": tag.sub("", row[5]).strip().upper() or "--",
+            "asset_description": tag.sub("", row[4]).strip(),
+            "asset_type": "Stock",
+            "type": tag.sub("", row[6]).strip(),
+            "amount": tag.sub("", row[7]).strip(),
+            "comment": "",
+            "senator": f"{tag.sub('', row[0]).strip()} {tag.sub('', row[1]).strip()}".strip(),
+            "disclosure_date": row[9].strip(),
+            "ptr_link": ptr_link,
+        }
+
+    # JSON row (keys vary by efdsearch version)
+    first = (row.get("first_name") or "").strip()
+    last  = (row.get("last_name")  or "").strip()
+    senator = f"{first} {last}".strip() or row.get("senator_name", "").strip()
+    if not senator:
+        return None
+
+    tx_date = (row.get("transaction_date") or row.get("date") or "").strip()
+    if not tx_date:
+        return None
+
+    ptr_link = row.get("ptr_link") or row.get("link") or ""
+    if not ptr_link and row.get("document_id"):
+        ptr_link = f"https://efdsearch.senate.gov/search/view/ptr/{row['document_id']}/"
+
+    return {
+        "transaction_date": tx_date,
+        "owner": (row.get("owner") or "self").strip(),
+        "ticker": (row.get("ticker") or "--").strip().upper(),
+        "asset_description": (row.get("asset_description") or "").strip(),
+        "asset_type": row.get("asset_type", ""),
+        "type": (row.get("type") or row.get("transaction_type") or "").strip(),
+        "amount": (row.get("amount") or "").strip(),
+        "comment": row.get("comment", ""),
+        "senator": senator,
+        "disclosure_date": (row.get("filing_date") or row.get("disclosure_date") or tx_date).strip(),
+        "ptr_link": ptr_link,
+    }
 
 
 def fetch_range(from_date: str, to_date: str) -> list[dict]:
-    """Fetch all PTR filings between from_date and to_date (YYYY-MM-DD).
+    """Fetch all PTR filings where filing_date is in [from_date, to_date]."""
+    opener = _make_opener()
 
-    The EFTS dateRange filter applies to filing_date (disclosure date), not
-    transaction_date — correct for incremental pulls.
-    """
-    all_hits: list[dict] = []
+    print(f"Getting CSRF token from {_HOME_URL}")
+    csrf = _get_csrf(opener)
+    print(f"CSRF: {csrf[:16]}...")
+
+    all_results: list[dict] = []
     start = 0
     total = None
 
     while True:
         try:
-            data = _efts_fetch_page(from_date, to_date, start)
-        except urllib.error.URLError as exc:
+            raw_rows, page_total = _search_page(opener, csrf, from_date, to_date, start)
+        except Exception as exc:
             print(f"ERROR fetching page start={start}: {exc}", file=sys.stderr)
             sys.exit(1)
 
-        hits = data.get("hits", {})
         if total is None:
-            total = hits.get("total", {}).get("value", 0)
+            total = page_total
             print(f"Total filings in range: {total}")
 
-        page_hits = hits.get("hits", [])
-        all_hits.extend(page_hits)
-        print(f"  fetched {len(all_hits)}/{total}")
+        new = [_normalise_json_row(r) for r in raw_rows]
+        new = [r for r in new if r is not None]
+        all_results.extend(new)
+        print(f"  fetched {len(all_results)}/{total}")
 
-        if len(page_hits) < _PAGE_SIZE or len(all_hits) >= total:
+        if len(raw_rows) < _PAGE_SIZE or len(all_results) >= total:
             break
 
         start += _PAGE_SIZE
         time.sleep(0.5)
 
-    return all_hits
-
-
-def _normalise(hit: dict) -> dict | None:
-    """Convert one EFTS hit to senate_stock_watcher field format."""
-    src = hit.get("_source", {})
-
-    first = (src.get("first_name") or "").strip()
-    last = (src.get("last_name") or "").strip()
-    # EFTS sometimes has a combined senator field too; fall back if names missing.
-    senator = (
-        f"{first} {last}".strip()
-        or src.get("senator_name", "").strip()
-        or src.get("senator", "").strip()
-    )
-    if not senator:
-        return None
-
-    tx_date = (
-        src.get("transaction_date")
-        or src.get("date")
-        or ""
-    ).strip()
-    if not tx_date:
-        return None
-
-    # Disclosure/filing date — EFTS uses filing_date or disclosure_date
-    filing_date = (
-        src.get("filing_date")
-        or src.get("disclosure_date")
-        or tx_date
-    ).strip()
-
-    # Build ptr_link from _id if not present in _source
-    ptr_link = src.get("ptr_link") or src.get("doc_link") or ""
-    if not ptr_link and hit.get("_id"):
-        ptr_link = f"https://efdsearch.senate.gov/search/view/ptr/{hit['_id']}/"
-
-    return {
-        "transaction_date": tx_date,
-        "owner": src.get("owner", "").strip() or "self",
-        "ticker": (src.get("ticker") or "").strip().upper() or "--",
-        "asset_description": (src.get("asset_description") or "").strip(),
-        "asset_type": src.get("asset_type", ""),
-        "type": src.get("type", "").strip(),
-        "amount": src.get("amount", "").strip(),
-        "comment": src.get("comment", ""),
-        "senator": senator,
-        "disclosure_date": filing_date,
-        "ptr_link": ptr_link,
-    }
+    return all_results
 
 
 def main() -> None:
@@ -133,13 +219,12 @@ def main() -> None:
 
     today = date.today()
     from_date = args.from_date or (today - timedelta(days=14)).isoformat()
-    to_date = args.to_date or today.isoformat()
+    to_date   = args.to_date   or today.isoformat()
 
     print(f"Fetching Senate PTR filings {from_date} → {to_date}")
 
-    hits = fetch_range(from_date, to_date)
-    new_rows = [r for r in (_normalise(h) for h in hits) if r is not None]
-    print(f"Normalised {len(new_rows)} rows from {len(hits)} hits")
+    new_rows = fetch_range(from_date, to_date)
+    print(f"Normalised {len(new_rows)} rows")
 
     existing: list[dict] = json.loads(_AGGREGATE_PATH.read_text())
     existing_links: set[str] = {r.get("ptr_link", "") for r in existing}
@@ -152,17 +237,15 @@ def main() -> None:
         return
 
     merged = existing + added
-    # Sort by disclosure_date descending so newest filings are first
+
     def _sort_key(r: dict) -> tuple:
         raw = r.get("disclosure_date") or r.get("transaction_date") or ""
-        # Dates are MM/DD/YYYY — convert to YYYY-MM-DD for sorting
         parts = raw.split("/")
         if len(parts) == 3:
             return (parts[2], parts[0], parts[1])
         return (raw, "", "")
 
     merged.sort(key=_sort_key, reverse=True)
-
     _AGGREGATE_PATH.write_text(json.dumps(merged, indent=2, ensure_ascii=False))
     print(f"Wrote {len(merged)} rows to {_AGGREGATE_PATH}")
 
