@@ -1,0 +1,61 @@
+name: Fetch Senate PTR Filings
+
+on:
+  # Daily at 07:15 UTC — catches filings submitted the previous US business day.
+  # PTRs are filed on a rolling basis (senators have 30-45 days per STOCK Act),
+  # so daily is the right polling cadence; running more often doesn't help.
+  schedule:
+    - cron: "15 7 * * *"
+
+  # Manual trigger: for the initial backfill and any recovery runs.
+  # Leave from_date/to_date empty to fetch the default 14-day window.
+  workflow_dispatch:
+    inputs:
+      from_date:
+        description: "Start date (YYYY-MM-DD)"
+        required: false
+        default: ""
+      to_date:
+        description: "End date (YYYY-MM-DD)"
+        required: false
+        default: ""
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to push the updated aggregate file
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch PTR filings
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.from_date }}" ]; then
+            ARGS="--from ${{ github.event.inputs.from_date }}"
+          fi
+          if [ -n "${{ github.event.inputs.to_date }}" ]; then
+            ARGS="$ARGS --to ${{ github.event.inputs.to_date }}"
+          fi
+          python scripts/fetch.py $ARGS
+
+      - name: Commit updated aggregate
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add aggregate/all_transactions.json
+          # Only commit if there's actually a change
+          if git diff --cached --quiet; then
+            echo "No new filings — nothing to commit."
+          else
+            COUNT=$(python3 -c "import json; print(len(json.load(open('aggregate/all_transactions.json'))))")
+            git commit -m "chore: update Senate PTR aggregate ($COUNT rows)"
+            git push
+          fi
