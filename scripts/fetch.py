@@ -1,26 +1,28 @@
 """Fetch Senate STOCK Act PTR filings from efdsearch.senate.gov.
 
-Uses Playwright (headless Chromium) to bypass Akamai bot-protection on
-/search/report/data/, then makes programmatic fetch() calls from within
-the browser to paginate through all results.
+Uses Playwright (headless Chromium) to:
+  1. Accept the prohibition agreement.
+  2. Submit the search form with date range + PTR report type.
+  3. Intercept DataTables AJAX responses from /search/report/data/ for pagination.
+  4. Merge new filings into aggregate/all_transactions.json.
 
 Usage:
     python scripts/fetch.py                          # last 14 days
     python scripts/fetch.py --from 2021-01-01 --to 2021-12-31
 
-Requires: pip install playwright && playwright install chromium
+Requires: pip install playwright && playwright install chromium --with-deps
 """
 import argparse
 import json
 import re
 import sys
-import time
 from datetime import date, timedelta
 from pathlib import Path
 
-_AGGREGATE_PATH = Path(__file__).parent.parent / "aggregate" / "all_transactions.json"
 _HOME_URL = "https://efdsearch.senate.gov/search/home/"
+_DATA_PATH = "https://efdsearch.senate.gov/search/report/data/"
 _PAGE_SIZE = 100
+_AGGREGATE_PATH = Path(__file__).parent.parent / "aggregate" / "all_transactions.json"
 
 
 def _to_mdy(iso: str) -> str:
@@ -28,61 +30,25 @@ def _to_mdy(iso: str) -> str:
     return f"{m}/{d}/{y}"
 
 
-def _fetch_page_js(from_date: str, to_date: str, start: int) -> str:
-    """Return a JS snippet that POSTs /search/report/data/ and returns JSON string."""
-    params = {
-        "report_types": '["6"]',      # 6 = Periodic Transaction Report
-        "filer_types": '["1"]',       # 1 = senator
-        "submitted_start_date": _to_mdy(from_date),
-        "submitted_end_date": _to_mdy(to_date),
-        "candidate_state": "",
-        "senator_state": "",
-        "office_id": "",
-        "first_name": "",
-        "last_name": "",
-        "start": str(start),
-        "length": str(_PAGE_SIZE),
-        "draw": str(start // _PAGE_SIZE + 1),
-    }
-    # Build URLSearchParams entries as a JS literal
-    entries = json.dumps(list(params.items()))
-    return f"""
-(async function() {{
-    const params = new URLSearchParams({entries});
-    const csrf = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
-    const resp = await fetch('/search/report/data/', {{
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {{
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'X-CSRFToken': csrf,
-            'X-Requested-With': 'XMLHttpRequest'
-        }},
-        body: params.toString()
-    }});
-    const text = await resp.text();
-    return JSON.stringify({{status: resp.status, body: text}});
-}})()
-"""
+def _strip_tags(s: str) -> str:
+    return re.sub(r"<[^>]+>", "", s or "").strip()
 
 
 def _normalise(row: list) -> dict | None:
-    """Normalise one DataTables row.
+    """Normalise one DataTables row from /search/report/data/.
 
-    Columns on /search/report/data/ (5 cols):
+    Columns (5):
       [0] First name (HTML)
       [1] Last name (HTML)
       [2] Office (HTML)
-      [3] Report type + link HTML  e.g. <a href="/search/view/ptr/UUID/">Periodic…</a>
+      [3] Report type + link HTML — e.g. <a href="/search/view/ptr/UUID/">Periodic Transaction Report</a>
       [4] Date filed MM/DD/YYYY (HTML)
     """
     if not isinstance(row, list) or len(row) < 5:
         return None
 
-    strip_tags = lambda s: re.sub(r"<[^>]+>", "", s or "").strip()
-
-    first = strip_tags(row[0])
-    last  = strip_tags(row[1])
+    first  = _strip_tags(row[0])
+    last   = _strip_tags(row[1])
     senator = f"{first} {last}".strip()
     if not senator:
         return None
@@ -93,10 +59,10 @@ def _normalise(row: list) -> dict | None:
         path = link_m.group(1)
         ptr_link = ("https://efdsearch.senate.gov" + path) if path.startswith("/") else path
 
-    filed_date = strip_tags(row[4])
+    filed_date = _strip_tags(row[4])
 
     return {
-        "transaction_date": "",
+        "transaction_date": "",    # not in search results; only in individual PTR PDF
         "owner": "self",
         "ticker": "--",
         "asset_description": "",
@@ -114,6 +80,7 @@ def fetch_range(from_date: str, to_date: str) -> list[dict]:
     from playwright.sync_api import sync_playwright
 
     all_results: list[dict] = []
+    total: int | None = None
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -125,90 +92,63 @@ def fetch_range(from_date: str, to_date: str) -> list[dict]:
         )
         page = context.new_page()
 
-        # Monitor ALL network responses for debugging
-        network_log: list[str] = []
-        def on_response(response):
-            network_log.append(f"  RESP {response.status} {response.url[:90]}")
-        page.on("response", on_response)
-
-        # Step 1: load agreement page
-        print(f"Loading agreement page: {_HOME_URL}")
+        # ── Step 1: accept the prohibition agreement ─────────────────────────────
         page.goto(_HOME_URL, wait_until="domcontentloaded")
-        print(f"  page.url after goto: {page.url}")
-
-        # Step 2: click the agreement checkbox — jQuery handler calls form.submit()
         page.click("#agree_statement")
-        try:
-            # wait for redirect to /search/ (NOT /search/home/)
-            page.wait_for_url("https://efdsearch.senate.gov/search/", timeout=10_000)
-        except Exception as e:
-            print(f"  wait_for_url timed out or failed: {e}")
-            print(f"  current URL: {page.url}")
+        page.wait_for_url("https://efdsearch.senate.gov/search/", timeout=10_000)
+        print(f"Accepted agreement → {page.url}")
 
-        print(f"Landed on: {page.url}")
-        print("Network log:")
-        for line in network_log:
-            print(line)
-        network_log.clear()
+        # ── Step 2: submit search form (fills in dates + triggers DataTables) ────
+        page.fill('input[name="submitted_start_date"]', _to_mdy(from_date))
+        page.fill('input[name="submitted_end_date"]',   _to_mdy(to_date))
 
-        # Confirm we have a csrftoken cookie
-        cookies = context.cookies()
-        csrf_cookie = next((c["value"] for c in cookies if c["name"] == "csrftoken"), "")
-        print(f"csrftoken cookie present: {bool(csrf_cookie)}")
+        # Set page length to 100 so fewer AJAX calls are needed
+        # DataTables renders a <select> for length
+        page.select_option("select[name='filedReports_length']", "100")
 
-        # Step 3: dump the search form fields to understand inputs
-        form_html = page.inner_html("#searchForm") if page.query_selector("#searchForm") else "(no searchForm)"
-        print(f"searchForm HTML (first 2000):\n{form_html[:2000]}")
-
-        # Step 4: fill the date fields and submit the search form
-        start_sel = 'input[name="submitted_start_date"]'
-        end_sel   = 'input[name="submitted_end_date"]'
-        if page.query_selector(start_sel):
-            page.fill(start_sel, _to_mdy(from_date))
-            page.fill(end_sel,   _to_mdy(to_date))
-            print(f"Filled date fields: {_to_mdy(from_date)} → {_to_mdy(to_date)}")
-        else:
-            print("WARNING: date input fields not found — trying to submit form anyway")
-
-        # Select PTR type if there's a checkbox/select
-        # (The form may have report_type checkboxes — look for type_6 or similar)
-        for sel in ['input[value="6"]', '#id_report_types_6', 'input[name="report_types"]']:
-            el = page.query_selector(sel)
-            if el and not el.is_checked():
-                page.check(sel)
-                print(f"Checked report type selector: {sel}")
-                break
-
-        # Capture all /search/report/data/ AJAX responses
-        captured_pages: list[dict] = []
-        def on_response(response):
-            url = response.url
-            network_log.append(f"  RESP {response.status} {url[:90]}")
-            if "/search/report/data/" in url and response.status == 200:
+        # Intercept the first DataTables response to get total count
+        captured: list[dict] = []
+        def on_response(resp):
+            if _DATA_PATH in resp.url and resp.status == 200:
                 try:
-                    captured_pages.append(response.json())
+                    captured.append(resp.json())
                 except Exception:
                     pass
         page.on("response", on_response)
 
-        print("Submitting search form...")
         page.click('button[type="submit"]')
-        page.wait_for_load_state("networkidle", timeout=15_000)
+        page.wait_for_load_state("networkidle", timeout=20_000)
 
-        print("Network log after form submit:")
-        for line in network_log:
-            print(line)
-
-        print(f"Captured {len(captured_pages)} AJAX responses")
-        if captured_pages:
-            first = captured_pages[0]
-            total_count = first.get("recordsFiltered", first.get("recordsTotal", "?"))
-            print(f"First page total: {total_count}, rows: {len(first.get('data', []))}")
-            sys.exit(0)  # success probe — report and stop
-        else:
-            print("No successful AJAX responses to /search/report/data/ — exiting", file=sys.stderr)
+        if not captured:
+            print("ERROR: no successful /search/report/data/ response after form submit", file=sys.stderr)
             browser.close()
             sys.exit(1)
+
+        first_page = captured[-1]  # last captured = most recent AJAX call
+        total = int(first_page.get("recordsFiltered", first_page.get("recordsTotal", 0)))
+        rows = first_page.get("data", [])
+        all_results.extend(r for r in (_normalise(row) for row in rows) if r)
+        print(f"Total PTR filings: {total} | fetched {len(all_results)}/{total}")
+
+        # ── Step 3: paginate by clicking "Next" until all rows collected ─────────
+        while len(all_results) < total:
+            captured.clear()
+            # Click DataTables "Next" button
+            next_btn = page.query_selector("a.paginate_button.next:not(.disabled)")
+            if not next_btn:
+                print("No more pages (Next button disabled or missing)")
+                break
+            next_btn.click()
+            page.wait_for_load_state("networkidle", timeout=15_000)
+
+            if not captured:
+                print("WARNING: Next page click yielded no AJAX response")
+                break
+
+            page_data = captured[-1]
+            rows = page_data.get("data", [])
+            all_results.extend(r for r in (_normalise(row) for row in rows) if r)
+            print(f"  fetched {len(all_results)}/{total}")
 
         browser.close()
 
@@ -227,7 +167,7 @@ def main() -> None:
 
     print(f"Fetching Senate PTR filings {from_date} → {to_date}")
     new_rows = fetch_range(from_date, to_date)
-    print(f"Normalised {len(new_rows)} filings")
+    print(f"Fetched {len(new_rows)} filings")
 
     existing: list[dict] = json.loads(_AGGREGATE_PATH.read_text())
     existing_links: set[str] = {r.get("ptr_link", "") for r in existing}
