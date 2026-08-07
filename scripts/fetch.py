@@ -42,10 +42,20 @@ def _make_opener() -> urllib.request.OpenerDirector:
 
 
 def _get_csrf_and_action(opener: urllib.request.OpenerDirector) -> tuple[str, str]:
-    """Fetch the search home page; return (csrf_token, form_action_url)."""
+    """Fetch the search home page; return (csrf_token, search_ajax_url).
+
+    The eFDS search form is a Django view backed by DataTables server-side
+    processing. The real AJAX endpoint is usually embedded in an inline <script>
+    block, not in the <form action=""> attribute.
+    """
     req = urllib.request.Request(_HOME_URL, headers=_HEADERS)
     with opener.open(req, timeout=20) as r:
         body = r.read().decode(errors="replace")
+
+    # Always print the page for debugging until we have a stable URL
+    print("=== HOME PAGE DUMP (first 3000 chars) ===")
+    print(body[:3000])
+    print("=== END DUMP ===")
 
     # Extract CSRF token
     m = re.search(r'name="csrfmiddlewaretoken"[^>]*value="([^"]+)"', body)
@@ -53,27 +63,40 @@ def _get_csrf_and_action(opener: urllib.request.OpenerDirector) -> tuple[str, st
         m = re.search(r'value="([^"]+)"[^>]*name="csrfmiddlewaretoken"', body)
     if not m:
         m = re.search(r"csrfmiddlewaretoken.*?value=['\"]([^'\"]+)", body, re.DOTALL)
-    if not m:
-        print("WARNING: no CSRF token found — page snippet:", body[:800], file=sys.stderr)
-        csrf = ""
-    else:
-        csrf = m.group(1)
+    csrf = m.group(1) if m else ""
+    print(f"CSRF: {csrf[:20] if csrf else '(none found)'}")
 
-    # Extract form action to find the correct POST endpoint
+    # Strategy 1: DataTables ajax URL in JavaScript
+    # Patterns seen in various Django-DataTables setups:
+    #   "ajax": "/search/report/data/"
+    #   ajaxUrl = "/search/results/"
+    #   url: "/path/to/data"
+    for pat in [
+        r'"ajax"\s*:\s*["\']([^"\']+)["\']',
+        r"ajax\s*:\s*['\"]([^'\"]+)['\"]",
+        r"ajaxUrl\s*[=:]\s*['\"]([^'\"]+)['\"]",
+        r"url\s*:\s*['\"]([/][^'\"]+)['\"]",
+    ]:
+        js_m = re.search(pat, body, re.IGNORECASE)
+        if js_m:
+            action = js_m.group(1)
+            if action.startswith("/"):
+                action = _BASE_URL + action
+            print(f"DataTables AJAX URL found ({pat[:30]}): {action}")
+            return csrf, action
+
+    # Strategy 2: form action attribute
     form_m = re.search(r'<form[^>]+action=["\']([^"\']+)["\']', body, re.IGNORECASE)
     if form_m:
         action = form_m.group(1)
         if action.startswith("/"):
             action = _BASE_URL + action
-        print(f"Form action found: {action}")
-    else:
-        # Fall back to POSTing to the home page itself (Django form default)
-        action = _HOME_URL
-        print(f"WARNING: no form action found — falling back to {action}")
-        # Print a page snippet for debugging
-        print("Page snippet (first 1000 chars):", body[:1000], file=sys.stderr)
+        print(f"Form action attribute: {action}")
+        return csrf, action
 
-    return csrf, action
+    # Strategy 3: POST to the home page (Django default when no action attr)
+    print(f"No AJAX URL or form action found — using home URL as POST target")
+    return csrf, _HOME_URL
 
 
 def _search_page(
