@@ -56,8 +56,9 @@ def _normalise_search_row(row: list) -> dict | None:
     Columns: [0] First name, [1] Last name, [2] Office,
              [3] Report type + link HTML, [4] Date filed MM/DD/YYYY.
 
-    Returns None for non-PTR report types (annual reports, extension notices,
-    etc.) since those require a different parsing strategy.
+    Accepts PTR filings (/ptr/) and annual reports (/annual/) — both have the
+    same transaction table structure. Skips extension notices and amendments
+    (no transaction data).
     """
     if not isinstance(row, list) or len(row) < 5:
         return None
@@ -74,8 +75,8 @@ def _normalise_search_row(row: list) -> dict | None:
     path = link_m.group(1)
     ptr_link = ("https://efdsearch.senate.gov" + path) if path.startswith("/") else path
 
-    # Only scrape actual PTR view pages (not annual reports or extension notices)
-    if "/ptr/" not in ptr_link:
+    # Accept PTR and annual report pages; skip extension notices / amendments
+    if "/ptr/" not in ptr_link and "/annual/" not in ptr_link:
         return None
 
     filed_date = _strip_tags(row[4])
