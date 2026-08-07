@@ -30,9 +30,9 @@ _HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.9",
     "Accept-Language": "en-US,en;q=0.9",
 }
-_HOME_URL    = "https://efdsearch.senate.gov/search/home/"
-_SEARCH_URL  = "https://efdsearch.senate.gov/search/results/"
-_PAGE_SIZE   = 100
+_HOME_URL   = "https://efdsearch.senate.gov/search/home/"
+_BASE_URL   = "https://efdsearch.senate.gov"
+_PAGE_SIZE  = 100
 _AGGREGATE_PATH = Path(__file__).parent.parent / "aggregate" / "all_transactions.json"
 
 
@@ -41,24 +41,45 @@ def _make_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
 
-def _get_csrf(opener: urllib.request.OpenerDirector) -> str:
-    """Fetch the search home page and return the CSRF token."""
+def _get_csrf_and_action(opener: urllib.request.OpenerDirector) -> tuple[str, str]:
+    """Fetch the search home page; return (csrf_token, form_action_url)."""
     req = urllib.request.Request(_HOME_URL, headers=_HEADERS)
     with opener.open(req, timeout=20) as r:
         body = r.read().decode(errors="replace")
-    m = re.search(r'name="csrfmiddlewaretoken"\s+value="([^"]+)"', body)
+
+    # Extract CSRF token
+    m = re.search(r'name="csrfmiddlewaretoken"[^>]*value="([^"]+)"', body)
     if not m:
-        # Try alternate quote style
-        m = re.search(r"csrfmiddlewaretoken['\"].*?value=['\"]([^'\"]+)", body)
+        m = re.search(r'value="([^"]+)"[^>]*name="csrfmiddlewaretoken"', body)
     if not m:
-        print("WARNING: could not extract CSRF token — response snippet:", body[:500], file=sys.stderr)
-        return ""
-    return m.group(1)
+        m = re.search(r"csrfmiddlewaretoken.*?value=['\"]([^'\"]+)", body, re.DOTALL)
+    if not m:
+        print("WARNING: no CSRF token found — page snippet:", body[:800], file=sys.stderr)
+        csrf = ""
+    else:
+        csrf = m.group(1)
+
+    # Extract form action to find the correct POST endpoint
+    form_m = re.search(r'<form[^>]+action=["\']([^"\']+)["\']', body, re.IGNORECASE)
+    if form_m:
+        action = form_m.group(1)
+        if action.startswith("/"):
+            action = _BASE_URL + action
+        print(f"Form action found: {action}")
+    else:
+        # Fall back to POSTing to the home page itself (Django form default)
+        action = _HOME_URL
+        print(f"WARNING: no form action found — falling back to {action}")
+        # Print a page snippet for debugging
+        print("Page snippet (first 1000 chars):", body[:1000], file=sys.stderr)
+
+    return csrf, action
 
 
 def _search_page(
     opener: urllib.request.OpenerDirector,
     csrf: str,
+    search_url: str,
     from_date: str,
     to_date: str,
     start: int,
@@ -78,10 +99,11 @@ def _search_page(
         "submitted_end_date":   to_mdy(to_date),
         "start": start,
         "length": _PAGE_SIZE,
+        "draw": start // _PAGE_SIZE + 1,  # DataTables draw counter
     }).encode()
 
     req = urllib.request.Request(
-        _SEARCH_URL, data=form, method="POST",
+        search_url, data=form, method="POST",
         headers={
             **_HEADERS,
             "Content-Type": "application/x-www-form-urlencoded",
@@ -176,9 +198,9 @@ def fetch_range(from_date: str, to_date: str) -> list[dict]:
     """Fetch all PTR filings where filing_date is in [from_date, to_date]."""
     opener = _make_opener()
 
-    print(f"Getting CSRF token from {_HOME_URL}")
-    csrf = _get_csrf(opener)
-    print(f"CSRF: {csrf[:16]}...")
+    print(f"Getting CSRF token and form action from {_HOME_URL}")
+    csrf, search_url = _get_csrf_and_action(opener)
+    print(f"CSRF: {csrf[:16] if csrf else '(none)'}... | POST target: {search_url}")
 
     all_results: list[dict] = []
     start = 0
@@ -186,7 +208,7 @@ def fetch_range(from_date: str, to_date: str) -> list[dict]:
 
     while True:
         try:
-            raw_rows, page_total = _search_page(opener, csrf, from_date, to_date, start)
+            raw_rows, page_total = _search_page(opener, csrf, search_url, from_date, to_date, start)
         except Exception as exc:
             print(f"ERROR fetching page start={start}: {exc}", file=sys.stderr)
             sys.exit(1)
