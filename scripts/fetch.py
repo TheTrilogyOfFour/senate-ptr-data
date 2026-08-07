@@ -102,10 +102,6 @@ def fetch_range(from_date: str, to_date: str) -> list[dict]:
         page.fill('input[name="submitted_start_date"]', _to_mdy(from_date))
         page.fill('input[name="submitted_end_date"]',   _to_mdy(to_date))
 
-        # Set page length to 100 so fewer AJAX calls are needed
-        # DataTables renders a <select> for length
-        page.select_option("select[name='filedReports_length']", "100")
-
         # Intercept the first DataTables response to get total count
         captured: list[dict] = []
         def on_response(resp):
