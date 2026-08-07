@@ -2,10 +2,27 @@
 
 Uses Playwright (headless Chromium) to:
   1. Accept the prohibition agreement.
-  2. Submit the search form with date range + PTR report type.
-  3. Read rows directly from the DataTables DOM (#filedReports tbody tr) and
-     paginate by clicking Next until all rows are collected.
-  4. Merge new filings into aggregate/all_transactions.json.
+  2. Submit the search form with date range, collecting all PTR filing links.
+  3. Visit each PTR view page within the same browser session to extract
+     individual transactions (ticker, type, amount, transaction date).
+  4. Merge new transactions into aggregate/all_transactions.json.
+
+Each row in the aggregate is one *transaction* (not one PTR filing), so the
+format matches senatestockwatcher.com's pre-parsed JSON:
+
+  {
+    "senator":          "Thomas H Tuberville",
+    "disclosure_date":  "08/05/2026",   # MM/DD/YYYY — date PTR was filed
+    "transaction_date": "07/15/2026",   # date of the actual trade
+    "ticker":           "NVDA",
+    "asset_description":"NVIDIA Corp",
+    "asset_type":       "Stock",
+    "type":             "Purchase",
+    "amount":           "$15,001 - $50,000",
+    "comment":          "",
+    "owner":            "self",
+    "ptr_link":         "https://efdsearch.senate.gov/search/view/ptr/…/"
+  }
 
 Usage:
     python scripts/fetch.py                          # last 14 days
@@ -33,53 +50,149 @@ def _strip_tags(s: str) -> str:
     return re.sub(r"<[^>]+>", "", s or "").strip()
 
 
-def _normalise(row: list) -> dict | None:
-    """Normalise one DataTables row from /search/report/data/.
+def _normalise_search_row(row: list) -> dict | None:
+    """Parse one DataTables search-result row (5 columns) into filing metadata.
 
-    Columns (5):
-      [0] First name (HTML)
-      [1] Last name (HTML)
-      [2] Office (HTML)
-      [3] Report type + link HTML — e.g. <a href="/search/view/ptr/UUID/">Periodic Transaction Report</a>
-      [4] Date filed MM/DD/YYYY (HTML)
+    Columns: [0] First name, [1] Last name, [2] Office,
+             [3] Report type + link HTML, [4] Date filed MM/DD/YYYY.
+
+    Returns None for non-PTR report types (annual reports, extension notices,
+    etc.) since those require a different parsing strategy.
     """
     if not isinstance(row, list) or len(row) < 5:
         return None
 
-    first  = _strip_tags(row[0])
-    last   = _strip_tags(row[1])
+    first = _strip_tags(row[0])
+    last  = _strip_tags(row[1])
     senator = f"{first} {last}".strip()
     if not senator:
         return None
 
     link_m = re.search(r'href=["\']([^"\']+)["\']', row[3])
-    ptr_link = ""
-    if link_m:
-        path = link_m.group(1)
-        ptr_link = ("https://efdsearch.senate.gov" + path) if path.startswith("/") else path
+    if not link_m:
+        return None
+    path = link_m.group(1)
+    ptr_link = ("https://efdsearch.senate.gov" + path) if path.startswith("/") else path
+
+    # Only scrape actual PTR view pages (not annual reports or extension notices)
+    if "/ptr/" not in ptr_link:
+        return None
 
     filed_date = _strip_tags(row[4])
-
     return {
-        "transaction_date": "",    # not in search results; only in individual PTR PDF
-        "owner": "self",
-        "ticker": "--",
-        "asset_description": "",
-        "asset_type": "",
-        "type": "",
-        "amount": "",
-        "comment": "",
         "senator": senator,
         "disclosure_date": filed_date,
         "ptr_link": ptr_link,
     }
 
 
+def _scrape_ptr_transactions(page, filing: dict) -> list[dict]:
+    """Navigate to one PTR view page and extract individual transactions.
+
+    Returns a list of transaction dicts (one per row in the PTR table).
+    The browser session (with the efdsearch.senate.gov agreement cookie) must
+    already be active — the PTR view page is behind the same Akamai wall.
+
+    PTR table columns (order may vary by filing era):
+      Asset Name | Asset Type | Transaction Type | Transaction Date |
+      Notification Date | Amount | Comment
+
+    Falls back gracefully: if the page structure doesn't match, returns [].
+    """
+    senator       = filing["senator"]
+    disclosure_date = filing["disclosure_date"]
+    ptr_link      = filing["ptr_link"]
+
+    try:
+        page.goto(ptr_link, wait_until="domcontentloaded", timeout=15_000)
+    except Exception as exc:
+        print(f"  WARN: could not load {ptr_link}: {exc}")
+        return []
+
+    # Wait for the transaction table (class "table" on efdsearch PTR pages)
+    try:
+        page.wait_for_selector("table.table", timeout=10_000)
+    except Exception:
+        # Some PTRs have no transactions (e.g. correction notices)
+        return []
+
+    # Extract header + rows
+    raw = page.evaluate("""
+        () => {
+            const tables = document.querySelectorAll('table.table');
+            const results = [];
+            for (const tbl of tables) {
+                const headers = Array.from(
+                    tbl.querySelectorAll('thead th, thead td')
+                ).map(th => th.innerText.trim().toLowerCase());
+                const rows = Array.from(tbl.querySelectorAll('tbody tr')).map(tr =>
+                    Array.from(tr.querySelectorAll('td')).map(td => td.innerText.trim())
+                );
+                results.push({headers, rows});
+            }
+            return results;
+        }
+    """)
+
+    transactions = []
+    for table in raw:
+        headers = table["headers"]
+        rows    = table["rows"]
+
+        # Map column names to indices (defensive — column order varies)
+        def _col(candidates: list[str]) -> int | None:
+            for c in candidates:
+                for i, h in enumerate(headers):
+                    if c in h:
+                        return i
+            return None
+
+        i_asset   = _col(["asset name", "issuer", "asset"])
+        i_type    = _col(["asset type"])
+        i_tx_type = _col(["transaction type", "type of transaction", "type"])
+        i_tx_date = _col(["transaction date", "trade date"])
+        i_amount  = _col(["amount"])
+        i_comment = _col(["comment"])
+
+        if i_asset is None and i_tx_date is None:
+            continue  # not a transaction table
+
+        for row in rows:
+            if not row:
+                continue
+
+            def _get(idx: int | None) -> str:
+                return row[idx].strip() if idx is not None and idx < len(row) else ""
+
+            asset_name = _get(i_asset)
+            if not asset_name or asset_name == "--":
+                continue  # blank row or header repeated
+
+            # Extract ticker from asset name (often "AAPL (Stock)")
+            ticker_m = re.match(r"([A-Z]{1,5}(?:\.[A-Z])?)\s*[\(\[]", asset_name)
+            ticker = ticker_m.group(1) if ticker_m else "--"
+
+            transactions.append({
+                "senator":          senator,
+                "disclosure_date":  disclosure_date,
+                "transaction_date": _get(i_tx_date),
+                "ticker":           ticker,
+                "asset_description": asset_name,
+                "asset_type":       _get(i_type),
+                "type":             _get(i_tx_type),
+                "amount":           _get(i_amount),
+                "comment":          _get(i_comment),
+                "owner":            "self",
+                "ptr_link":         ptr_link,
+            })
+
+    return transactions
+
+
 def fetch_range(from_date: str, to_date: str) -> list[dict]:
     from playwright.sync_api import sync_playwright
 
-    all_results: list[dict] = []
-    total: int | None = None
+    all_transactions: list[dict] = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -91,23 +204,20 @@ def fetch_range(from_date: str, to_date: str) -> list[dict]:
         )
         page = context.new_page()
 
-        # ── Step 1: accept the prohibition agreement ─────────────────────────────
+        # ── Step 1: accept the prohibition agreement ──────────────────────────────
         page.goto(_HOME_URL, wait_until="domcontentloaded")
         page.click("#agree_statement")
         page.wait_for_url("https://efdsearch.senate.gov/search/", timeout=10_000)
         print(f"Accepted agreement → {page.url}")
 
-        # ── Step 2: submit search form (fills in dates + triggers DataTables) ────
+        # ── Step 2: submit search form ────────────────────────────────────────────
         page.fill('input[name="submitted_start_date"]', _to_mdy(from_date))
         page.fill('input[name="submitted_end_date"]',   _to_mdy(to_date))
 
-        # ── Step 3: submit form, wait for table, read rows from DOM ─────────────
         page.click('button[type="submit"]')
-        # Wait for DataTables to populate the table (processing indicator disappears)
         page.wait_for_selector("#filedReports tbody tr", timeout=20_000)
 
         def _read_table_rows() -> list[list[str]]:
-            """Extract current DataTables page rows as [[cell_html, ...], ...]."""
             return page.evaluate("""
                 () => Array.from(
                     document.querySelectorAll('#filedReports tbody tr')
@@ -117,27 +227,31 @@ def fetch_range(from_date: str, to_date: str) -> list[dict]:
             """)
 
         def _get_total() -> int:
-            """Extract total row count from DataTables info text."""
             info = page.inner_text(".dataTables_info") if page.query_selector(".dataTables_info") else ""
             m = re.search(r"of\s+([\d,]+)", info)
             return int(m.group(1).replace(",", "")) if m else 0
 
+        # ── Step 3: collect all PTR filing links via DataTables pagination ────────
         total = _get_total()
-        rows = _read_table_rows()
-        all_results.extend(r for r in (_normalise(row) for row in rows) if r)
-        print(f"Total PTR filings: {total} | fetched {len(all_results)}/{total}")
+        filings: list[dict] = []
+        rows_seen = 0
 
-        # ── Step 4: click Next until all rows collected ───────────────────────────
-        while len(all_results) < total:
+        raw_rows = _read_table_rows()
+        rows_seen += len(raw_rows)
+        for row in raw_rows:
+            f = _normalise_search_row(row)
+            if f:
+                filings.append(f)
+        print(f"Search total: {total} | page 1 rows: {len(raw_rows)}, PTRs found so far: {len(filings)}")
+
+        while rows_seen < total:
             next_btn = page.query_selector("a.paginate_button.next:not(.disabled)")
             if not next_btn:
-                print("No more pages (Next button disabled or missing)")
+                print("No more pages")
                 break
 
-            expected_start = len(all_results) + 1
+            expected_start = rows_seen + 1
             next_btn.click()
-            # Wait for DataTables info text to reflect the new page range:
-            # e.g. "Showing 26 to 50 of 383 entries" — the start number must advance.
             try:
                 page.wait_for_function(
                     f"""() => {{
@@ -150,16 +264,26 @@ def fetch_range(from_date: str, to_date: str) -> list[dict]:
             except Exception:
                 page.wait_for_load_state("networkidle", timeout=15_000)
 
-            rows = _read_table_rows()
-            if not rows:
-                print("WARNING: no rows on page after Next click")
-                break
-            all_results.extend(r for r in (_normalise(row) for row in rows) if r)
-            print(f"  fetched {len(all_results)}/{total}")
+            raw_rows = _read_table_rows()
+            rows_seen += len(raw_rows)
+            for row in raw_rows:
+                f = _normalise_search_row(row)
+                if f:
+                    filings.append(f)
+            print(f"  rows seen: {rows_seen}/{total}, PTRs so far: {len(filings)}")
+
+        print(f"\nCollected {len(filings)} PTR filing links out of {rows_seen} total results")
+
+        # ── Step 4: visit each PTR page and extract transactions ──────────────────
+        for i, filing in enumerate(filings, 1):
+            txns = _scrape_ptr_transactions(page, filing)
+            all_transactions.extend(txns)
+            status = f"{len(txns)} txn(s)" if txns else "0 txns (empty/error)"
+            print(f"  [{i}/{len(filings)}] {filing['senator']} {filing['disclosure_date']} — {status}")
 
         browser.close()
 
-    return all_results
+    return all_transactions
 
 
 def main() -> None:
@@ -172,14 +296,23 @@ def main() -> None:
     from_date = args.from_date or (today - timedelta(days=14)).isoformat()
     to_date   = args.to_date   or today.isoformat()
 
-    print(f"Fetching Senate PTR filings {from_date} → {to_date}")
-    new_rows = fetch_range(from_date, to_date)
-    print(f"Fetched {len(new_rows)} filings")
+    print(f"Fetching Senate PTR transactions {from_date} → {to_date}")
+    new_txns = fetch_range(from_date, to_date)
+    print(f"\nFetched {len(new_txns)} transactions total")
 
-    existing: list[dict] = json.loads(_AGGREGATE_PATH.read_text())
-    existing_links: set[str] = {r.get("ptr_link", "") for r in existing}
+    existing: list[dict] = json.loads(_AGGREGATE_PATH.read_text()) if _AGGREGATE_PATH.exists() else []
+    # Deduplicate on (ptr_link, ticker, transaction_date, type)
+    existing_keys: set[tuple] = {
+        (r.get("ptr_link",""), r.get("ticker",""), r.get("transaction_date",""), r.get("type",""))
+        for r in existing
+        if r.get("ptr_link")
+    }
 
-    added = [r for r in new_rows if r.get("ptr_link") and r["ptr_link"] not in existing_links]
+    added = [
+        r for r in new_txns
+        if (r.get("ptr_link",""), r.get("ticker",""), r.get("transaction_date",""), r.get("type",""))
+        not in existing_keys
+    ]
     print(f"New (not in aggregate): {len(added)}")
 
     if not added:
