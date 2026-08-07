@@ -135,38 +135,32 @@ def _scrape_ptr_transactions(page, filing: dict) -> list[dict]:
     """)
 
     transactions = []
-    first_table = True
     for table in raw:
         headers = table["headers"]
         rows    = table["rows"]
 
-        if first_table:
-            print(f"  [headers] {headers}")
-            first_table = False
-
-        # Map column names to indices.
-        # Use word-level matching so "type" does not match "asset type".
+        # Map column names to indices — exact match first to avoid "type" matching
+        # "asset type" via substring. Actual efdsearch headers (as of 2026-08):
+        #   ['#', 'transaction date', 'owner', 'ticker', 'asset name',
+        #    'asset type', 'type', 'amount', 'comment']
         def _col(candidates: list[str]) -> int | None:
             for c in candidates:
                 for i, h in enumerate(headers):
-                    if h == c:          # exact
+                    if h == c:                   # exact — checked first
                         return i
                 for i, h in enumerate(headers):
-                    if h.startswith(c + " ") or h.endswith(" " + c):  # boundary
-                        return i
-                for i, h in enumerate(headers):
-                    if (" " + c + " ") in (" " + h + " "):  # word inside
+                    if h.startswith(c + " "):    # "transaction date" → matches
                         return i
             return None
 
-        # "Purchase/Sale" is the efdsearch label for transaction direction
-        i_asset   = _col(["asset name", "issuer name", "asset"])
+        i_asset   = _col(["asset name", "issuer name"])
         i_type    = _col(["asset type"])
-        i_tx_type = _col(["purchase/sale", "transaction type", "type of transaction"])
-        i_tx_date = _col(["transaction date", "date of transaction", "trade date", "date"])
+        i_tx_type = _col(["type", "purchase/sale", "transaction type"])  # "type" exact
+        i_tx_date = _col(["transaction date", "trade date"])
         i_amount  = _col(["amount"])
         i_comment = _col(["comment"])
         i_ticker  = _col(["ticker", "symbol"])
+        i_owner   = _col(["owner"])
 
         if i_asset is None and i_tx_date is None:
             continue  # not a transaction table
@@ -203,7 +197,7 @@ def _scrape_ptr_transactions(page, filing: dict) -> list[dict]:
                 "type":             _get(i_tx_type),
                 "amount":           _get(i_amount),
                 "comment":          _get(i_comment),
-                "owner":            "self",
+                "owner":            _get(i_owner) or "self",
                 "ptr_link":         ptr_link,
             })
 
