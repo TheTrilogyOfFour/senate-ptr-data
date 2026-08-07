@@ -18,6 +18,7 @@ import json
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, timedelta
@@ -138,11 +139,16 @@ def _search_page(
             "X-CSRFToken": csrf_cookie,
         },
     )
-    with opener.open(req, timeout=30) as r:
-        ct = r.headers.get("Content-Type", "")
-        body = r.read()
-
-    print(f"  /search/report/data/ response: {r.status} | Content-Type: {ct[:60]}")
+    try:
+        with opener.open(req, timeout=30) as r:
+            ct = r.headers.get("Content-Type", "")
+            body = r.read()
+        print(f"  /search/report/data/ → {r.status} | {ct[:60]}")
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode(errors="replace")
+        print(f"  HTTP {exc.code} from /search/report/data/ | headers: {dict(exc.headers)}", file=sys.stderr)
+        print(f"  Error body (first 1000): {err_body[:1000]}", file=sys.stderr)
+        raise
 
     if "json" in ct:
         data = json.loads(body)
