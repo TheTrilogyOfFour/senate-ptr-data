@@ -3,7 +3,8 @@
 Uses Playwright (headless Chromium) to:
   1. Accept the prohibition agreement.
   2. Submit the search form with date range + PTR report type.
-  3. Intercept DataTables AJAX responses from /search/report/data/ for pagination.
+  3. Read rows directly from the DataTables DOM (#filedReports tbody tr) and
+     paginate by clicking Next until all rows are collected.
   4. Merge new filings into aggregate/all_transactions.json.
 
 Usage:
@@ -20,8 +21,6 @@ from datetime import date, timedelta
 from pathlib import Path
 
 _HOME_URL = "https://efdsearch.senate.gov/search/home/"
-_DATA_PATH = "https://efdsearch.senate.gov/search/report/data/"
-_PAGE_SIZE = 100
 _AGGREGATE_PATH = Path(__file__).parent.parent / "aggregate" / "all_transactions.json"
 
 
@@ -102,47 +101,59 @@ def fetch_range(from_date: str, to_date: str) -> list[dict]:
         page.fill('input[name="submitted_start_date"]', _to_mdy(from_date))
         page.fill('input[name="submitted_end_date"]',   _to_mdy(to_date))
 
-        # Intercept the first DataTables response to get total count
-        captured: list[dict] = []
-        def on_response(resp):
-            if _DATA_PATH in resp.url and resp.status == 200:
-                try:
-                    captured.append(resp.json())
-                except Exception:
-                    pass
-        page.on("response", on_response)
-
+        # ── Step 3: submit form, wait for table, read rows from DOM ─────────────
         page.click('button[type="submit"]')
-        page.wait_for_load_state("networkidle", timeout=20_000)
+        # Wait for DataTables to populate the table (processing indicator disappears)
+        page.wait_for_selector("#filedReports tbody tr", timeout=20_000)
 
-        if not captured:
-            print("ERROR: no successful /search/report/data/ response after form submit", file=sys.stderr)
-            browser.close()
-            sys.exit(1)
+        def _read_table_rows() -> list[list[str]]:
+            """Extract current DataTables page rows as [[cell_html, ...], ...]."""
+            return page.evaluate("""
+                () => Array.from(
+                    document.querySelectorAll('#filedReports tbody tr')
+                ).map(tr =>
+                    Array.from(tr.querySelectorAll('td')).map(td => td.innerHTML)
+                )
+            """)
 
-        first_page = captured[-1]  # last captured = most recent AJAX call
-        total = int(first_page.get("recordsFiltered", first_page.get("recordsTotal", 0)))
-        rows = first_page.get("data", [])
+        def _get_total() -> int:
+            """Extract total row count from DataTables info text."""
+            info = page.inner_text(".dataTables_info") if page.query_selector(".dataTables_info") else ""
+            m = re.search(r"of\s+([\d,]+)", info)
+            return int(m.group(1).replace(",", "")) if m else 0
+
+        total = _get_total()
+        rows = _read_table_rows()
         all_results.extend(r for r in (_normalise(row) for row in rows) if r)
         print(f"Total PTR filings: {total} | fetched {len(all_results)}/{total}")
 
-        # ── Step 3: paginate by clicking "Next" until all rows collected ─────────
+        # ── Step 4: click Next until all rows collected ───────────────────────────
         while len(all_results) < total:
-            captured.clear()
-            # Click DataTables "Next" button
             next_btn = page.query_selector("a.paginate_button.next:not(.disabled)")
             if not next_btn:
                 print("No more pages (Next button disabled or missing)")
                 break
+
+            expected_start = len(all_results) + 1
             next_btn.click()
-            page.wait_for_load_state("networkidle", timeout=15_000)
+            # Wait for DataTables info text to reflect the new page range:
+            # e.g. "Showing 26 to 50 of 383 entries" — the start number must advance.
+            try:
+                page.wait_for_function(
+                    f"""() => {{
+                        const info = document.querySelector('.dataTables_info')?.innerText || '';
+                        const m = info.match(/Showing ([\\d,]+) to/);
+                        return m && parseInt(m[1].replace(/,/g, '')) >= {expected_start};
+                    }}""",
+                    timeout=15_000,
+                )
+            except Exception:
+                page.wait_for_load_state("networkidle", timeout=15_000)
 
-            if not captured:
-                print("WARNING: Next page click yielded no AJAX response")
+            rows = _read_table_rows()
+            if not rows:
+                print("WARNING: no rows on page after Next click")
                 break
-
-            page_data = captured[-1]
-            rows = page_data.get("data", [])
             all_results.extend(r for r in (_normalise(row) for row in rows) if r)
             print(f"  fetched {len(all_results)}/{total}")
 
