@@ -207,29 +207,8 @@ def fetch_range(from_date: str, to_date: str) -> list[dict]:
             sys.exit(0)  # success probe — report and stop
         else:
             print("No successful AJAX responses to /search/report/data/ — exiting", file=sys.stderr)
+            browser.close()
             sys.exit(1)
-
-            try:
-                data = json.loads(body_text)
-            except json.JSONDecodeError:
-                print(f"  Non-JSON response: {body_text[:500]}", file=sys.stderr)
-                sys.exit(1)
-
-            if total is None:
-                total = int(data.get("recordsFiltered", data.get("recordsTotal", 0)))
-                print(f"Total PTR filings in range: {total}")
-
-            raw_rows = data.get("data", [])
-            new = [_normalise(r) for r in raw_rows]
-            new = [r for r in new if r is not None]
-            all_results.extend(new)
-            print(f"  fetched {len(all_results)}/{total}")
-
-            if not raw_rows or len(all_results) >= total:
-                break
-
-            start += _PAGE_SIZE
-            time.sleep(0.3)
 
         browser.close()
 
