@@ -5,43 +5,47 @@ Usage:
     python scripts/fetch.py                          # last 14 days
     python scripts/fetch.py --from 2021-01-01 --to 2021-12-31   # backfill range
 
-Deduplicates on ptr_link (the UUID in the URL is stable across re-fetches).
+Deduplicates on ptr_link (the UUID in the filing URL is stable across re-fetches).
 
-The Senate eFDS search (efdsearch.senate.gov) is a Django app — we need a
-session cookie + CSRF token before each POST.  efts.senate.gov was decommissioned.
+Flow:
+  1. GET /search/home/ → agreement page; extract CSRF token.
+  2. POST /search/home/ with prohibition_agreement=1 → session cookie set; lands on /search/.
+  3. POST /search/report/data/ (DataTables AJAX endpoint) with report_types=["6"] + date range.
+     X-CSRFToken header from the csrftoken session cookie.
 """
 import argparse
 import json
 import re
 import sys
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, timedelta
 from http.cookiejar import CookieJar
 from pathlib import Path
 
+_HOME_URL    = "https://efdsearch.senate.gov/search/home/"
+_SEARCH_URL  = "https://efdsearch.senate.gov/search/"
+_DATA_URL    = "https://efdsearch.senate.gov/search/report/data/"
+_PAGE_SIZE   = 100
+_AGGREGATE_PATH = Path(__file__).parent.parent / "aggregate" / "all_transactions.json"
+
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.9",
     "Accept-Language": "en-US,en;q=0.9",
 }
-_HOME_URL    = "https://efdsearch.senate.gov/search/home/"
-_BASE_URL    = "https://efdsearch.senate.gov"
-_PAGE_SIZE   = 100
-_AGGREGATE_PATH = Path(__file__).parent.parent / "aggregate" / "all_transactions.json"
 
 
-def _make_opener() -> urllib.request.OpenerDirector:
+def _make_opener() -> tuple[urllib.request.OpenerDirector, CookieJar]:
     jar = CookieJar()
-    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    return opener, jar
 
 
-def _extract_csrf(body: str) -> str:
+def _get_csrf_from_html(body: str) -> str:
     for pat in [
         r'name="csrfmiddlewaretoken"[^>]*value="([^"]+)"',
         r'value="([^"]+)"[^>]*name="csrfmiddlewaretoken"',
@@ -53,249 +57,203 @@ def _extract_csrf(body: str) -> str:
     return ""
 
 
-def _find_ajax_url(body: str) -> str:
-    """Find DataTables server-side AJAX URL embedded in inline scripts."""
-    for pat in [
-        r'"ajax"\s*:\s*["\']([^"\']+)["\']',
-        r"ajax\s*:\s*['\"]([^'\"]+)['\"]",
-        r"ajaxUrl\s*[=:]\s*['\"]([^'\"]+)['\"]",
-    ]:
-        m = re.search(pat, body, re.IGNORECASE)
-        if m:
-            url = m.group(1)
-            return (_BASE_URL + url) if url.startswith("/") else url
+def _get_csrf_cookie(jar: CookieJar) -> str:
+    for cookie in jar:
+        if cookie.name == "csrftoken":
+            return cookie.value
     return ""
 
 
-def _get_session(opener: urllib.request.OpenerDirector) -> tuple[str, str]:
-    """Accept the eFDS prohibition agreement and return (csrf, search_ajax_url).
-
-    The flow:
-      1. GET /search/home/ — renders an agreement checkbox form.
-      2. POST /search/home/ with prohibition_agreement=1 + CSRF — accepts agreement,
-         sets a session cookie, and redirects to the real search page.
-      3. The real search page contains a DataTables init with the AJAX data URL.
-    """
-    # Step 1: load agreement page
-    req = urllib.request.Request(_HOME_URL, headers=_HEADERS)
+def _accept_agreement(opener: urllib.request.OpenerDirector, jar: CookieJar) -> str:
+    """Submit the prohibition agreement and return the csrftoken cookie value."""
+    # Step 1: load agreement page to get CSRF token
+    req = urllib.request.Request(
+        _HOME_URL,
+        headers={**_HEADERS, "Accept": "text/html,*/*;q=0.9"},
+    )
     with opener.open(req, timeout=20) as r:
-        body1 = r.read().decode(errors="replace")
+        body = r.read().decode(errors="replace")
 
-    csrf1 = _extract_csrf(body1)
-    print(f"Agreement page CSRF: {csrf1[:20] if csrf1 else '(none)'}")
+    csrf_form = _get_csrf_from_html(body)
+    print(f"Agreement page CSRF (form): {csrf_form[:20] if csrf_form else '(none)'}")
 
-    # Step 2: submit agreement
+    # Step 2: submit the agreement checkbox
     form_data = urllib.parse.urlencode({
         "prohibition_agreement": "1",
-        "csrfmiddlewaretoken": csrf1,
+        "csrfmiddlewaretoken": csrf_form,
     }).encode()
     req2 = urllib.request.Request(
         _HOME_URL, data=form_data, method="POST",
-        headers={**_HEADERS,
-                 "Content-Type": "application/x-www-form-urlencoded",
-                 "Referer": _HOME_URL},
+        headers={
+            **_HEADERS,
+            "Accept": "text/html,*/*;q=0.9",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": _HOME_URL,
+        },
     )
     with opener.open(req2, timeout=20) as r:
-        body2 = r.read().decode(errors="replace")
-        search_page_url = r.geturl()
+        _ = r.read()
+        landed = r.geturl()
 
-    print(f"After agreement POST, landed on: {search_page_url}")
-
-    # Extract fresh CSRF and DataTables AJAX URL from the search page
-    csrf2 = _extract_csrf(body2)
-    ajax_url = _find_ajax_url(body2)
-
-    print(f"Search page CSRF: {csrf2[:20] if csrf2 else '(none)'}")
-    print(f"DataTables AJAX URL: {ajax_url or '(not found — will dump scripts)'}")
-
-    if not ajax_url:
-        # Print ALL inline scripts in full so we can see the DataTables init
-        print("=== ALL INLINE SCRIPTS (full) ===")
-        for i, sm in enumerate(re.finditer(r'<script(?![^>]*src)[^>]*>(.*?)</script>', body2, re.DOTALL | re.IGNORECASE)):
-            snippet = sm.group(1).strip()
-            if snippet:
-                print(f"--- script {i} ---")
-                print(snippet)  # no truncation
-
-    return csrf2, ajax_url or search_page_url
+    csrf_cookie = _get_csrf_cookie(jar)
+    print(f"Landed on: {landed} | csrftoken cookie: {csrf_cookie[:20] if csrf_cookie else '(none)'}")
+    return csrf_cookie
 
 
 def _search_page(
     opener: urllib.request.OpenerDirector,
-    csrf: str,
-    search_url: str,
+    csrf_cookie: str,
     from_date: str,
     to_date: str,
     start: int,
 ) -> tuple[list[dict], int]:
-    """POST one page of PTR search results.  Returns (rows, total)."""
-    # efdsearch uses MM/DD/YYYY in form fields
+    """POST one page to /search/report/data/.  Returns (raw_rows, total_count)."""
     def to_mdy(iso: str) -> str:
         y, m, d = iso.split("-")
         return f"{m}/{d}/{y}"
 
     form = urllib.parse.urlencode({
-        "csrfmiddlewaretoken": csrf,
-        "action": "search",
-        "type[]": "6",          # 6 = Periodic Transaction Report
-        "filer_type": "1",      # 1 = senator
+        "report_types": '["6"]',    # 6 = Periodic Transaction Report
+        "filer_types": '["1"]',     # 1 = senator
         "submitted_start_date": to_mdy(from_date),
         "submitted_end_date":   to_mdy(to_date),
+        "candidate_state": "",
+        "senator_state": "",
+        "office_id": "",
+        "first_name": "",
+        "last_name": "",
         "start": start,
         "length": _PAGE_SIZE,
-        "draw": start // _PAGE_SIZE + 1,  # DataTables draw counter
+        "draw": start // _PAGE_SIZE + 1,
     }).encode()
 
     req = urllib.request.Request(
-        search_url, data=form, method="POST",
+        _DATA_URL, data=form, method="POST",
         headers={
             **_HEADERS,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": _HOME_URL,
-            "X-Requested-With": "XMLHttpRequest",
             "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": _SEARCH_URL,
+            "X-Requested-With": "XMLHttpRequest",
+            "X-CSRFToken": csrf_cookie,
         },
     )
     with opener.open(req, timeout=30) as r:
         ct = r.headers.get("Content-Type", "")
         body = r.read()
 
+    print(f"  /search/report/data/ response: {r.status} | Content-Type: {ct[:60]}")
+
     if "json" in ct:
         data = json.loads(body)
         rows = data.get("data", [])
-        total = data.get("recordsTotal", len(rows))
+        total = int(data.get("recordsFiltered", data.get("recordsTotal", len(rows))))
         return rows, total
 
-    # Fallback: HTML table parse
+    # Unexpected non-JSON — print for debugging
     text = body.decode(errors="replace")
-    # The table has rows like: <td>name</td><td>ticker</td>...
-    # Count entries from "Showing X to Y of Z entries"
-    total_m = re.search(r"of\s+([\d,]+)\s+entries", text)
-    total = int(total_m.group(1).replace(",", "")) if total_m else 0
-    # Extract table rows
-    row_pat = re.compile(r"<tr[^>]*>(.*?)</tr>", re.DOTALL)
-    cell_pat = re.compile(r"<td[^>]*>(.*?)</td>", re.DOTALL)
-    tag_pat  = re.compile(r"<[^>]+>")
-    rows = []
-    for row_m in row_pat.finditer(text):
-        cells = [tag_pat.sub("", c.group(1)).strip()
-                 for c in cell_pat.finditer(row_m.group(1))]
-        if len(cells) >= 4:
-            rows.append(cells)
-    return rows, total
+    print(f"  Non-JSON response (first 500): {text[:500]}", file=sys.stderr)
+    return [], 0
 
 
-def _normalise_json_row(row: dict | list) -> dict | None:
-    """Normalise one row from efdsearch JSON or HTML-table parse."""
-    if isinstance(row, list):
-        # HTML table columns: [first, last, office, type, asset, ticker, tx_type, amount, tx_date, filed_date, ptr_link_html]
-        if len(row) < 10:
-            return None
-        tag = re.compile(r"<[^>]+>")
-        href = re.search(r'href="([^"]+)"', row[-1]) if len(row) > 10 else None
-        ptr_link = ("https://efdsearch.senate.gov" + href.group(1)) if href else ""
-        return {
-            "transaction_date": row[8].strip(),
-            "owner": "self",
-            "ticker": tag.sub("", row[5]).strip().upper() or "--",
-            "asset_description": tag.sub("", row[4]).strip(),
-            "asset_type": "Stock",
-            "type": tag.sub("", row[6]).strip(),
-            "amount": tag.sub("", row[7]).strip(),
-            "comment": "",
-            "senator": f"{tag.sub('', row[0]).strip()} {tag.sub('', row[1]).strip()}".strip(),
-            "disclosure_date": row[9].strip(),
-            "ptr_link": ptr_link,
-        }
+def _normalise(row: list) -> dict | None:
+    """Normalise one DataTables row.
 
-    # JSON row (keys vary by efdsearch version)
-    first = (row.get("first_name") or "").strip()
-    last  = (row.get("last_name")  or "").strip()
-    senator = f"{first} {last}".strip() or row.get("senator_name", "").strip()
+    The /search/report/data/ response 'data' field is a list of lists.
+    Columns (from DataTables config — 5 columns):
+      [0] First name
+      [1] Last name
+      [2] Office (role, e.g. "Senator (MD)")
+      [3] Report type + link HTML  (e.g. '<a href="/search/view/ptr/UUID/">Periodic Transaction Report</a>')
+      [4] Date filed (MM/DD/YYYY)
+    """
+    if not isinstance(row, list) or len(row) < 5:
+        return None
+
+    first = re.sub(r"<[^>]+>", "", row[0]).strip()
+    last  = re.sub(r"<[^>]+>", "", row[1]).strip()
+    senator = f"{first} {last}".strip()
     if not senator:
         return None
 
-    tx_date = (row.get("transaction_date") or row.get("date") or "").strip()
-    if not tx_date:
-        return None
+    # Extract ptr_link and report label from column 3
+    link_m = re.search(r'href=["\']([^"\']+)["\']', row[3])
+    ptr_link = ""
+    if link_m:
+        path = link_m.group(1)
+        ptr_link = ("https://efdsearch.senate.gov" + path) if path.startswith("/") else path
 
-    ptr_link = row.get("ptr_link") or row.get("link") or ""
-    if not ptr_link and row.get("document_id"):
-        ptr_link = f"https://efdsearch.senate.gov/search/view/ptr/{row['document_id']}/"
+    # Date filed (disclosure_date) is column 4
+    filed_date = re.sub(r"<[^>]+>", "", row[4]).strip()
 
     return {
-        "transaction_date": tx_date,
-        "owner": (row.get("owner") or "self").strip(),
-        "ticker": (row.get("ticker") or "--").strip().upper(),
-        "asset_description": (row.get("asset_description") or "").strip(),
-        "asset_type": row.get("asset_type", ""),
-        "type": (row.get("type") or row.get("transaction_type") or "").strip(),
-        "amount": (row.get("amount") or "").strip(),
-        "comment": row.get("comment", ""),
+        "transaction_date": "",          # not available at this level; filled from PDF
+        "owner": "self",
+        "ticker": "--",
+        "asset_description": "",
+        "asset_type": "",
+        "type": "",
+        "amount": "",
+        "comment": "",
         "senator": senator,
-        "disclosure_date": (row.get("filing_date") or row.get("disclosure_date") or tx_date).strip(),
+        "disclosure_date": filed_date,
         "ptr_link": ptr_link,
     }
 
 
 def fetch_range(from_date: str, to_date: str) -> list[dict]:
-    """Fetch all PTR filings where filing_date is in [from_date, to_date]."""
-    opener = _make_opener()
+    opener, jar = _make_opener()
+    csrf_cookie = _accept_agreement(opener, jar)
 
-    csrf, search_url = _get_session(opener)
-    print(f"Using search URL: {search_url}")
+    if not csrf_cookie:
+        print("ERROR: no csrftoken cookie after agreement POST", file=sys.stderr)
+        sys.exit(1)
 
     all_results: list[dict] = []
     start = 0
     total = None
 
     while True:
-        try:
-            raw_rows, page_total = _search_page(opener, csrf, search_url, from_date, to_date, start)
-        except Exception as exc:
-            print(f"ERROR fetching page start={start}: {exc}", file=sys.stderr)
-            sys.exit(1)
+        raw_rows, page_total = _search_page(opener, csrf_cookie, from_date, to_date, start)
 
         if total is None:
             total = page_total
-            print(f"Total filings in range: {total}")
+            print(f"Total PTR filings in range: {total}")
 
-        new = [_normalise_json_row(r) for r in raw_rows]
+        new = [_normalise(r) for r in raw_rows]
         new = [r for r in new if r is not None]
         all_results.extend(new)
         print(f"  fetched {len(all_results)}/{total}")
 
-        if len(raw_rows) < _PAGE_SIZE or len(all_results) >= total:
+        if not raw_rows or len(all_results) >= total:
             break
 
         start += _PAGE_SIZE
-        time.sleep(0.5)
+        time.sleep(0.3)
 
     return all_results
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--from", dest="from_date", default=None,
-                        help="Start date YYYY-MM-DD (default: 14 days ago)")
-    parser.add_argument("--to", dest="to_date", default=None,
-                        help="End date YYYY-MM-DD (default: today)")
+    parser.add_argument("--from", dest="from_date", default=None)
+    parser.add_argument("--to",   dest="to_date",   default=None)
     args = parser.parse_args()
 
-    today = date.today()
+    today     = date.today()
     from_date = args.from_date or (today - timedelta(days=14)).isoformat()
     to_date   = args.to_date   or today.isoformat()
 
     print(f"Fetching Senate PTR filings {from_date} → {to_date}")
 
     new_rows = fetch_range(from_date, to_date)
-    print(f"Normalised {len(new_rows)} rows")
+    print(f"Normalised {len(new_rows)} filings")
 
     existing: list[dict] = json.loads(_AGGREGATE_PATH.read_text())
     existing_links: set[str] = {r.get("ptr_link", "") for r in existing}
 
-    added = [r for r in new_rows if r["ptr_link"] not in existing_links]
-    print(f"New (not already in aggregate): {len(added)}")
+    added = [r for r in new_rows if r.get("ptr_link") and r["ptr_link"] not in existing_links]
+    print(f"New (not in aggregate): {len(added)}")
 
     if not added:
         print("Nothing new — aggregate unchanged.")
@@ -303,12 +261,12 @@ def main() -> None:
 
     merged = existing + added
 
-    def _sort_key(r: dict) -> tuple:
-        raw = r.get("disclosure_date") or r.get("transaction_date") or ""
+    def _sort_key(r: dict) -> str:
+        raw = r.get("disclosure_date") or ""
         parts = raw.split("/")
         if len(parts) == 3:
-            return (parts[2], parts[0], parts[1])
-        return (raw, "", "")
+            return f"{parts[2]}/{parts[0]:0>2}/{parts[1]:0>2}"
+        return raw
 
     merged.sort(key=_sort_key, reverse=True)
     _AGGREGATE_PATH.write_text(json.dumps(merged, indent=2, ensure_ascii=False))
