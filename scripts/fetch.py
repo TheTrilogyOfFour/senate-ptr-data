@@ -109,13 +109,17 @@ def _get_session(opener: urllib.request.OpenerDirector) -> tuple[str, str]:
     print(f"DataTables AJAX URL: {ajax_url or '(not found — will dump scripts)'}")
 
     if not ajax_url:
-        # Dump inline scripts so we can diagnose
-        print("=== INLINE SCRIPTS ON SEARCH PAGE ===")
-        for sm in re.finditer(r'<script(?![^>]*src)[^>]*>(.*?)</script>', body2, re.DOTALL | re.IGNORECASE):
-            snippet = sm.group(1).strip()
-            if snippet:
-                print(snippet[:800])
-                print("---")
+        # Dump forms and external script sources on the search page
+        print("=== FORMS ON SEARCH PAGE ===")
+        for fm in re.finditer(r'<form[^>]*>', body2, re.IGNORECASE):
+            print(fm.group())
+        print("=== EXTERNAL SCRIPTS ON SEARCH PAGE ===")
+        for sm in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']', body2, re.IGNORECASE):
+            print(sm.group(1))
+        print("=== FIRST 500 chars after <body> ===")
+        body_m = re.search(r'<body[^>]*>(.*)', body2, re.DOTALL | re.IGNORECASE)
+        if body_m:
+            print(body_m.group(1)[:1500])
 
     return csrf2, ajax_url or search_page_url
 
