@@ -125,17 +125,44 @@ def fetch_range(from_date: str, to_date: str) -> list[dict]:
         )
         page = context.new_page()
 
-        # Accept the prohibition agreement
+        # Monitor ALL network responses for debugging
+        network_log: list[str] = []
+        def on_response(response):
+            network_log.append(f"  RESP {response.status} {response.url[:90]}")
+        page.on("response", on_response)
+
+        # Step 1: load agreement page
         print(f"Loading agreement page: {_HOME_URL}")
-        page.goto(_HOME_URL, wait_until="networkidle")
-        page.check("#agree_statement")
-        page.wait_for_url("**/search/**", timeout=10_000)
+        page.goto(_HOME_URL, wait_until="domcontentloaded")
+        print(f"  page.url after goto: {page.url}")
+
+        # Step 2: click the agreement checkbox — jQuery handler calls form.submit()
+        page.click("#agree_statement")
+        try:
+            # wait for redirect to /search/ (NOT /search/home/)
+            page.wait_for_url("https://efdsearch.senate.gov/search/", timeout=10_000)
+        except Exception as e:
+            print(f"  wait_for_url timed out or failed: {e}")
+            print(f"  current URL: {page.url}")
+
         print(f"Landed on: {page.url}")
+        print("Network log:")
+        for line in network_log:
+            print(line)
+        network_log.clear()
 
         # Confirm we have a csrftoken cookie
         cookies = context.cookies()
         csrf_cookie = next((c["value"] for c in cookies if c["name"] == "csrftoken"), "")
         print(f"csrftoken cookie present: {bool(csrf_cookie)}")
+
+        # Step 3: wait for DataTables to make its initial AJAX call
+        # Give the page time to fully initialize and make the first AJAX call
+        page.wait_for_load_state("networkidle", timeout=15_000)
+        print("Network log after page settle:")
+        for line in network_log:
+            print(line)
+        network_log.clear()
 
         # Paginate through results using in-browser fetch() calls
         start = 0
@@ -151,7 +178,7 @@ def fetch_range(from_date: str, to_date: str) -> list[dict]:
             print(f"  /search/report/data/ start={start} → HTTP {status}")
 
             if status != 200:
-                print(f"  Unexpected status {status}. Body (first 500): {body_text[:500]}", file=sys.stderr)
+                print(f"  Body (first 500): {body_text[:500]}", file=sys.stderr)
                 sys.exit(1)
 
             try:
