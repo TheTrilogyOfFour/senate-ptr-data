@@ -52,10 +52,17 @@ def _get_csrf_and_action(opener: urllib.request.OpenerDirector) -> tuple[str, st
     with opener.open(req, timeout=20) as r:
         body = r.read().decode(errors="replace")
 
-    # Always print the page for debugging until we have a stable URL
-    print("=== HOME PAGE DUMP (first 3000 chars) ===")
-    print(body[:3000])
-    print("=== END DUMP ===")
+    # Targeted debug: pull out <form> tags and inline scripts to find the AJAX URL
+    print("=== FORM TAGS ===")
+    for fm in re.finditer(r'<form[^>]*>.*?</form>', body, re.DOTALL | re.IGNORECASE):
+        print(fm.group()[:800])
+        print("---")
+    print("=== INLINE SCRIPTS ===")
+    for sm in re.finditer(r'<script(?![^>]*src)[^>]*>(.*?)</script>', body, re.DOTALL | re.IGNORECASE):
+        snippet = sm.group(1).strip()
+        if snippet:
+            print(snippet[:600])
+            print("---")
 
     # Extract CSRF token
     m = re.search(r'name="csrfmiddlewaretoken"[^>]*value="([^"]+)"', body)
