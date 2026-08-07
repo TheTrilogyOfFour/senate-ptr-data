@@ -156,30 +156,58 @@ def fetch_range(from_date: str, to_date: str) -> list[dict]:
         csrf_cookie = next((c["value"] for c in cookies if c["name"] == "csrftoken"), "")
         print(f"csrftoken cookie present: {bool(csrf_cookie)}")
 
-        # Step 3: wait for DataTables to make its initial AJAX call
-        # Give the page time to fully initialize and make the first AJAX call
+        # Step 3: dump the search form fields to understand inputs
+        form_html = page.inner_html("#searchForm") if page.query_selector("#searchForm") else "(no searchForm)"
+        print(f"searchForm HTML (first 2000):\n{form_html[:2000]}")
+
+        # Step 4: fill the date fields and submit the search form
+        start_sel = 'input[name="submitted_start_date"]'
+        end_sel   = 'input[name="submitted_end_date"]'
+        if page.query_selector(start_sel):
+            page.fill(start_sel, _to_mdy(from_date))
+            page.fill(end_sel,   _to_mdy(to_date))
+            print(f"Filled date fields: {_to_mdy(from_date)} → {_to_mdy(to_date)}")
+        else:
+            print("WARNING: date input fields not found — trying to submit form anyway")
+
+        # Select PTR type if there's a checkbox/select
+        # (The form may have report_type checkboxes — look for type_6 or similar)
+        for sel in ['input[value="6"]', '#id_report_types_6', 'input[name="report_types"]']:
+            el = page.query_selector(sel)
+            if el and not el.is_checked():
+                page.check(sel)
+                print(f"Checked report type selector: {sel}")
+                break
+
+        # Capture all /search/report/data/ AJAX responses
+        captured_pages: list[dict] = []
+        def on_response(response):
+            url = response.url
+            network_log.append(f"  RESP {response.status} {url[:90]}")
+            if "/search/report/data/" in url and response.status == 200:
+                try:
+                    captured_pages.append(response.json())
+                except Exception:
+                    pass
+        page.on("response", on_response)
+
+        print("Submitting search form...")
+        page.click('button[type="submit"]')
         page.wait_for_load_state("networkidle", timeout=15_000)
-        print("Network log after page settle:")
+
+        print("Network log after form submit:")
         for line in network_log:
             print(line)
-        network_log.clear()
 
-        # Paginate through results using in-browser fetch() calls
-        start = 0
-        total = None
-
-        while True:
-            js = _fetch_page_js(from_date, to_date, start)
-            result_str = page.evaluate(js)
-            result = json.loads(result_str)
-
-            status = result.get("status")
-            body_text = result.get("body", "")
-            print(f"  /search/report/data/ start={start} → HTTP {status}")
-
-            if status != 200:
-                print(f"  Body (first 500): {body_text[:500]}", file=sys.stderr)
-                sys.exit(1)
+        print(f"Captured {len(captured_pages)} AJAX responses")
+        if captured_pages:
+            first = captured_pages[0]
+            total_count = first.get("recordsFiltered", first.get("recordsTotal", "?"))
+            print(f"First page total: {total_count}, rows: {len(first.get('data', []))}")
+            sys.exit(0)  # success probe — report and stop
+        else:
+            print("No successful AJAX responses to /search/report/data/ — exiting", file=sys.stderr)
+            sys.exit(1)
 
             try:
                 data = json.loads(body_text)
