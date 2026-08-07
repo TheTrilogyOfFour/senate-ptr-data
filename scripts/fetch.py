@@ -135,24 +135,38 @@ def _scrape_ptr_transactions(page, filing: dict) -> list[dict]:
     """)
 
     transactions = []
+    first_table = True
     for table in raw:
         headers = table["headers"]
         rows    = table["rows"]
 
-        # Map column names to indices (defensive — column order varies)
+        if first_table:
+            print(f"  [headers] {headers}")
+            first_table = False
+
+        # Map column names to indices.
+        # Use word-level matching so "type" does not match "asset type".
         def _col(candidates: list[str]) -> int | None:
             for c in candidates:
                 for i, h in enumerate(headers):
-                    if c in h:
+                    if h == c:          # exact
+                        return i
+                for i, h in enumerate(headers):
+                    if h.startswith(c + " ") or h.endswith(" " + c):  # boundary
+                        return i
+                for i, h in enumerate(headers):
+                    if (" " + c + " ") in (" " + h + " "):  # word inside
                         return i
             return None
 
-        i_asset   = _col(["asset name", "issuer", "asset"])
+        # "Purchase/Sale" is the efdsearch label for transaction direction
+        i_asset   = _col(["asset name", "issuer name", "asset"])
         i_type    = _col(["asset type"])
-        i_tx_type = _col(["transaction type", "type of transaction", "type"])
-        i_tx_date = _col(["transaction date", "trade date"])
+        i_tx_type = _col(["purchase/sale", "transaction type", "type of transaction"])
+        i_tx_date = _col(["transaction date", "date of transaction", "trade date", "date"])
         i_amount  = _col(["amount"])
         i_comment = _col(["comment"])
+        i_ticker  = _col(["ticker", "symbol"])
 
         if i_asset is None and i_tx_date is None:
             continue  # not a transaction table
@@ -168,9 +182,16 @@ def _scrape_ptr_transactions(page, filing: dict) -> list[dict]:
             if not asset_name or asset_name == "--":
                 continue  # blank row or header repeated
 
-            # Extract ticker from asset name (often "AAPL (Stock)")
-            ticker_m = re.match(r"([A-Z]{1,5}(?:\.[A-Z])?)\s*[\(\[]", asset_name)
-            ticker = ticker_m.group(1) if ticker_m else "--"
+            # Ticker extraction — try dedicated column first, then asset_name patterns
+            if i_ticker is not None:
+                ticker = _get(i_ticker) or "--"
+            else:
+                # "Company Name (TICKER)" — ticker at end in parens
+                m = re.search(r'\(([A-Z]{1,5}(?:\.[A-Z])?)\)\s*$', asset_name)
+                if not m:
+                    # "TICKER (Description)" — ticker at start before paren
+                    m = re.match(r'^([A-Z]{1,5}(?:\.[A-Z])?)\s*[\(\[]', asset_name)
+                ticker = m.group(1) if m else "--"
 
             transactions.append({
                 "senator":          senator,
