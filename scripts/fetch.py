@@ -30,9 +30,9 @@ _HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/json,*/*;q=0.9",
     "Accept-Language": "en-US,en;q=0.9",
 }
-_HOME_URL   = "https://efdsearch.senate.gov/search/home/"
-_BASE_URL   = "https://efdsearch.senate.gov"
-_PAGE_SIZE  = 100
+_HOME_URL    = "https://efdsearch.senate.gov/search/home/"
+_BASE_URL    = "https://efdsearch.senate.gov"
+_PAGE_SIZE   = 100
 _AGGREGATE_PATH = Path(__file__).parent.parent / "aggregate" / "all_transactions.json"
 
 
@@ -41,69 +41,83 @@ def _make_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
 
-def _get_csrf_and_action(opener: urllib.request.OpenerDirector) -> tuple[str, str]:
-    """Fetch the search home page; return (csrf_token, search_ajax_url).
+def _extract_csrf(body: str) -> str:
+    for pat in [
+        r'name="csrfmiddlewaretoken"[^>]*value="([^"]+)"',
+        r'value="([^"]+)"[^>]*name="csrfmiddlewaretoken"',
+        r"csrfmiddlewaretoken.*?value=['\"]([^'\"]+)",
+    ]:
+        m = re.search(pat, body, re.DOTALL)
+        if m:
+            return m.group(1)
+    return ""
 
-    The eFDS search form is a Django view backed by DataTables server-side
-    processing. The real AJAX endpoint is usually embedded in an inline <script>
-    block, not in the <form action=""> attribute.
-    """
-    req = urllib.request.Request(_HOME_URL, headers=_HEADERS)
-    with opener.open(req, timeout=20) as r:
-        body = r.read().decode(errors="replace")
 
-    # Targeted debug: pull out <form> tags and inline scripts to find the AJAX URL
-    print("=== FORM TAGS ===")
-    for fm in re.finditer(r'<form[^>]*>.*?</form>', body, re.DOTALL | re.IGNORECASE):
-        print(fm.group()[:800])
-        print("---")
-    print("=== INLINE SCRIPTS ===")
-    for sm in re.finditer(r'<script(?![^>]*src)[^>]*>(.*?)</script>', body, re.DOTALL | re.IGNORECASE):
-        snippet = sm.group(1).strip()
-        if snippet:
-            print(snippet[:600])
-            print("---")
-
-    # Extract CSRF token
-    m = re.search(r'name="csrfmiddlewaretoken"[^>]*value="([^"]+)"', body)
-    if not m:
-        m = re.search(r'value="([^"]+)"[^>]*name="csrfmiddlewaretoken"', body)
-    if not m:
-        m = re.search(r"csrfmiddlewaretoken.*?value=['\"]([^'\"]+)", body, re.DOTALL)
-    csrf = m.group(1) if m else ""
-    print(f"CSRF: {csrf[:20] if csrf else '(none found)'}")
-
-    # Strategy 1: DataTables ajax URL in JavaScript
-    # Patterns seen in various Django-DataTables setups:
-    #   "ajax": "/search/report/data/"
-    #   ajaxUrl = "/search/results/"
-    #   url: "/path/to/data"
+def _find_ajax_url(body: str) -> str:
+    """Find DataTables server-side AJAX URL embedded in inline scripts."""
     for pat in [
         r'"ajax"\s*:\s*["\']([^"\']+)["\']',
         r"ajax\s*:\s*['\"]([^'\"]+)['\"]",
         r"ajaxUrl\s*[=:]\s*['\"]([^'\"]+)['\"]",
-        r"url\s*:\s*['\"]([/][^'\"]+)['\"]",
     ]:
-        js_m = re.search(pat, body, re.IGNORECASE)
-        if js_m:
-            action = js_m.group(1)
-            if action.startswith("/"):
-                action = _BASE_URL + action
-            print(f"DataTables AJAX URL found ({pat[:30]}): {action}")
-            return csrf, action
+        m = re.search(pat, body, re.IGNORECASE)
+        if m:
+            url = m.group(1)
+            return (_BASE_URL + url) if url.startswith("/") else url
+    return ""
 
-    # Strategy 2: form action attribute
-    form_m = re.search(r'<form[^>]+action=["\']([^"\']+)["\']', body, re.IGNORECASE)
-    if form_m:
-        action = form_m.group(1)
-        if action.startswith("/"):
-            action = _BASE_URL + action
-        print(f"Form action attribute: {action}")
-        return csrf, action
 
-    # Strategy 3: POST to the home page (Django default when no action attr)
-    print(f"No AJAX URL or form action found — using home URL as POST target")
-    return csrf, _HOME_URL
+def _get_session(opener: urllib.request.OpenerDirector) -> tuple[str, str]:
+    """Accept the eFDS prohibition agreement and return (csrf, search_ajax_url).
+
+    The flow:
+      1. GET /search/home/ — renders an agreement checkbox form.
+      2. POST /search/home/ with prohibition_agreement=1 + CSRF — accepts agreement,
+         sets a session cookie, and redirects to the real search page.
+      3. The real search page contains a DataTables init with the AJAX data URL.
+    """
+    # Step 1: load agreement page
+    req = urllib.request.Request(_HOME_URL, headers=_HEADERS)
+    with opener.open(req, timeout=20) as r:
+        body1 = r.read().decode(errors="replace")
+
+    csrf1 = _extract_csrf(body1)
+    print(f"Agreement page CSRF: {csrf1[:20] if csrf1 else '(none)'}")
+
+    # Step 2: submit agreement
+    form_data = urllib.parse.urlencode({
+        "prohibition_agreement": "1",
+        "csrfmiddlewaretoken": csrf1,
+    }).encode()
+    req2 = urllib.request.Request(
+        _HOME_URL, data=form_data, method="POST",
+        headers={**_HEADERS,
+                 "Content-Type": "application/x-www-form-urlencoded",
+                 "Referer": _HOME_URL},
+    )
+    with opener.open(req2, timeout=20) as r:
+        body2 = r.read().decode(errors="replace")
+        search_page_url = r.geturl()
+
+    print(f"After agreement POST, landed on: {search_page_url}")
+
+    # Extract fresh CSRF and DataTables AJAX URL from the search page
+    csrf2 = _extract_csrf(body2)
+    ajax_url = _find_ajax_url(body2)
+
+    print(f"Search page CSRF: {csrf2[:20] if csrf2 else '(none)'}")
+    print(f"DataTables AJAX URL: {ajax_url or '(not found — will dump scripts)'}")
+
+    if not ajax_url:
+        # Dump inline scripts so we can diagnose
+        print("=== INLINE SCRIPTS ON SEARCH PAGE ===")
+        for sm in re.finditer(r'<script(?![^>]*src)[^>]*>(.*?)</script>', body2, re.DOTALL | re.IGNORECASE):
+            snippet = sm.group(1).strip()
+            if snippet:
+                print(snippet[:800])
+                print("---")
+
+    return csrf2, ajax_url or search_page_url
 
 
 def _search_page(
@@ -228,9 +242,8 @@ def fetch_range(from_date: str, to_date: str) -> list[dict]:
     """Fetch all PTR filings where filing_date is in [from_date, to_date]."""
     opener = _make_opener()
 
-    print(f"Getting CSRF token and form action from {_HOME_URL}")
-    csrf, search_url = _get_csrf_and_action(opener)
-    print(f"CSRF: {csrf[:16] if csrf else '(none)'}... | POST target: {search_url}")
+    csrf, search_url = _get_session(opener)
+    print(f"Using search URL: {search_url}")
 
     all_results: list[dict] = []
     start = 0
