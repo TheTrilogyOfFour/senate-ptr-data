@@ -1,199 +1,102 @@
-"""Fetch Senate STOCK Act PTR filings from efdsearch.senate.gov and merge into
-aggregate/all_transactions.json in the senate_stock_watcher field format.
+"""Fetch Senate STOCK Act PTR filings from efdsearch.senate.gov.
+
+Uses Playwright (headless Chromium) to bypass Akamai bot-protection on
+/search/report/data/, then makes programmatic fetch() calls from within
+the browser to paginate through all results.
 
 Usage:
     python scripts/fetch.py                          # last 14 days
-    python scripts/fetch.py --from 2021-01-01 --to 2021-12-31   # backfill range
+    python scripts/fetch.py --from 2021-01-01 --to 2021-12-31
 
-Deduplicates on ptr_link (the UUID in the filing URL is stable across re-fetches).
-
-Flow:
-  1. GET /search/home/ → agreement page; extract CSRF token.
-  2. POST /search/home/ with prohibition_agreement=1 → session cookie set; lands on /search/.
-  3. POST /search/report/data/ (DataTables AJAX endpoint) with report_types=["6"] + date range.
-     X-CSRFToken header from the csrftoken session cookie.
+Requires: pip install playwright && playwright install chromium
 """
 import argparse
 import json
 import re
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from datetime import date, timedelta
-from http.cookiejar import CookieJar
 from pathlib import Path
 
-_HOME_URL    = "https://efdsearch.senate.gov/search/home/"
-_SEARCH_URL  = "https://efdsearch.senate.gov/search/"
-_DATA_URL    = "https://efdsearch.senate.gov/search/report/data/"
-_PAGE_SIZE   = 100
 _AGGREGATE_PATH = Path(__file__).parent.parent / "aggregate" / "all_transactions.json"
-
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
+_HOME_URL = "https://efdsearch.senate.gov/search/home/"
+_PAGE_SIZE = 100
 
 
-def _make_opener() -> tuple[urllib.request.OpenerDirector, CookieJar]:
-    jar = CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-    return opener, jar
+def _to_mdy(iso: str) -> str:
+    y, m, d = iso.split("-")
+    return f"{m}/{d}/{y}"
 
 
-def _get_csrf_from_html(body: str) -> str:
-    for pat in [
-        r'name="csrfmiddlewaretoken"[^>]*value="([^"]+)"',
-        r'value="([^"]+)"[^>]*name="csrfmiddlewaretoken"',
-        r"csrfmiddlewaretoken.*?value=['\"]([^'\"]+)",
-    ]:
-        m = re.search(pat, body, re.DOTALL)
-        if m:
-            return m.group(1)
-    return ""
-
-
-def _get_csrf_cookie(jar: CookieJar) -> str:
-    for cookie in jar:
-        if cookie.name == "csrftoken":
-            return cookie.value
-    return ""
-
-
-def _accept_agreement(opener: urllib.request.OpenerDirector, jar: CookieJar) -> str:
-    """Submit the prohibition agreement and return the csrftoken cookie value."""
-    # Step 1: load agreement page to get CSRF token
-    req = urllib.request.Request(
-        _HOME_URL,
-        headers={**_HEADERS, "Accept": "text/html,*/*;q=0.9"},
-    )
-    with opener.open(req, timeout=20) as r:
-        body = r.read().decode(errors="replace")
-
-    csrf_form = _get_csrf_from_html(body)
-    print(f"Agreement page CSRF (form): {csrf_form[:20] if csrf_form else '(none)'}")
-
-    # Step 2: submit the agreement checkbox
-    form_data = urllib.parse.urlencode({
-        "prohibition_agreement": "1",
-        "csrfmiddlewaretoken": csrf_form,
-    }).encode()
-    req2 = urllib.request.Request(
-        _HOME_URL, data=form_data, method="POST",
-        headers={
-            **_HEADERS,
-            "Accept": "text/html,*/*;q=0.9",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": _HOME_URL,
-        },
-    )
-    with opener.open(req2, timeout=20) as r:
-        _ = r.read()
-        landed = r.geturl()
-
-    csrf_cookie = _get_csrf_cookie(jar)
-    print(f"Landed on: {landed} | csrftoken cookie: {csrf_cookie[:20] if csrf_cookie else '(none)'}")
-    return csrf_cookie
-
-
-def _search_page(
-    opener: urllib.request.OpenerDirector,
-    csrf_cookie: str,
-    from_date: str,
-    to_date: str,
-    start: int,
-) -> tuple[list[dict], int]:
-    """POST one page to /search/report/data/.  Returns (raw_rows, total_count)."""
-    def to_mdy(iso: str) -> str:
-        y, m, d = iso.split("-")
-        return f"{m}/{d}/{y}"
-
-    form = urllib.parse.urlencode({
-        "report_types": '["6"]',    # 6 = Periodic Transaction Report
-        "filer_types": '["1"]',     # 1 = senator
-        "submitted_start_date": to_mdy(from_date),
-        "submitted_end_date":   to_mdy(to_date),
+def _fetch_page_js(from_date: str, to_date: str, start: int) -> str:
+    """Return a JS snippet that POSTs /search/report/data/ and returns JSON string."""
+    params = {
+        "report_types": '["6"]',      # 6 = Periodic Transaction Report
+        "filer_types": '["1"]',       # 1 = senator
+        "submitted_start_date": _to_mdy(from_date),
+        "submitted_end_date": _to_mdy(to_date),
         "candidate_state": "",
         "senator_state": "",
         "office_id": "",
         "first_name": "",
         "last_name": "",
-        "start": start,
-        "length": _PAGE_SIZE,
-        "draw": start // _PAGE_SIZE + 1,
-    }).encode()
-
-    req = urllib.request.Request(
-        _DATA_URL, data=form, method="POST",
-        headers={
-            **_HEADERS,
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": _SEARCH_URL,
-            "X-Requested-With": "XMLHttpRequest",
-            "X-CSRFToken": csrf_cookie,
-        },
-    )
-    try:
-        with opener.open(req, timeout=30) as r:
-            ct = r.headers.get("Content-Type", "")
-            body = r.read()
-        print(f"  /search/report/data/ → {r.status} | {ct[:60]}")
-    except urllib.error.HTTPError as exc:
-        err_body = exc.read().decode(errors="replace")
-        print(f"  HTTP {exc.code} from /search/report/data/ | headers: {dict(exc.headers)}", file=sys.stderr)
-        print(f"  Error body (first 1000): {err_body[:1000]}", file=sys.stderr)
-        raise
-
-    if "json" in ct:
-        data = json.loads(body)
-        rows = data.get("data", [])
-        total = int(data.get("recordsFiltered", data.get("recordsTotal", len(rows))))
-        return rows, total
-
-    # Unexpected non-JSON — print for debugging
-    text = body.decode(errors="replace")
-    print(f"  Non-JSON response (first 500): {text[:500]}", file=sys.stderr)
-    return [], 0
+        "start": str(start),
+        "length": str(_PAGE_SIZE),
+        "draw": str(start // _PAGE_SIZE + 1),
+    }
+    # Build URLSearchParams entries as a JS literal
+    entries = json.dumps(list(params.items()))
+    return f"""
+(async function() {{
+    const params = new URLSearchParams({entries});
+    const csrf = (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '';
+    const resp = await fetch('/search/report/data/', {{
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {{
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-CSRFToken': csrf,
+            'X-Requested-With': 'XMLHttpRequest'
+        }},
+        body: params.toString()
+    }});
+    const text = await resp.text();
+    return JSON.stringify({{status: resp.status, body: text}});
+}})()
+"""
 
 
 def _normalise(row: list) -> dict | None:
     """Normalise one DataTables row.
 
-    The /search/report/data/ response 'data' field is a list of lists.
-    Columns (from DataTables config — 5 columns):
-      [0] First name
-      [1] Last name
-      [2] Office (role, e.g. "Senator (MD)")
-      [3] Report type + link HTML  (e.g. '<a href="/search/view/ptr/UUID/">Periodic Transaction Report</a>')
-      [4] Date filed (MM/DD/YYYY)
+    Columns on /search/report/data/ (5 cols):
+      [0] First name (HTML)
+      [1] Last name (HTML)
+      [2] Office (HTML)
+      [3] Report type + link HTML  e.g. <a href="/search/view/ptr/UUID/">Periodic…</a>
+      [4] Date filed MM/DD/YYYY (HTML)
     """
     if not isinstance(row, list) or len(row) < 5:
         return None
 
-    first = re.sub(r"<[^>]+>", "", row[0]).strip()
-    last  = re.sub(r"<[^>]+>", "", row[1]).strip()
+    strip_tags = lambda s: re.sub(r"<[^>]+>", "", s or "").strip()
+
+    first = strip_tags(row[0])
+    last  = strip_tags(row[1])
     senator = f"{first} {last}".strip()
     if not senator:
         return None
 
-    # Extract ptr_link and report label from column 3
     link_m = re.search(r'href=["\']([^"\']+)["\']', row[3])
     ptr_link = ""
     if link_m:
         path = link_m.group(1)
         ptr_link = ("https://efdsearch.senate.gov" + path) if path.startswith("/") else path
 
-    # Date filed (disclosure_date) is column 4
-    filed_date = re.sub(r"<[^>]+>", "", row[4]).strip()
+    filed_date = strip_tags(row[4])
 
     return {
-        "transaction_date": "",          # not available at this level; filled from PDF
+        "transaction_date": "",
         "owner": "self",
         "ticker": "--",
         "asset_description": "",
@@ -208,34 +111,72 @@ def _normalise(row: list) -> dict | None:
 
 
 def fetch_range(from_date: str, to_date: str) -> list[dict]:
-    opener, jar = _make_opener()
-    csrf_cookie = _accept_agreement(opener, jar)
-
-    if not csrf_cookie:
-        print("ERROR: no csrftoken cookie after agreement POST", file=sys.stderr)
-        sys.exit(1)
+    from playwright.sync_api import sync_playwright
 
     all_results: list[dict] = []
-    start = 0
-    total = None
 
-    while True:
-        raw_rows, page_total = _search_page(opener, csrf_cookie, from_date, to_date, start)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+        )
+        page = context.new_page()
 
-        if total is None:
-            total = page_total
-            print(f"Total PTR filings in range: {total}")
+        # Accept the prohibition agreement
+        print(f"Loading agreement page: {_HOME_URL}")
+        page.goto(_HOME_URL, wait_until="networkidle")
+        page.check("#agree_statement")
+        page.wait_for_url("**/search/**", timeout=10_000)
+        print(f"Landed on: {page.url}")
 
-        new = [_normalise(r) for r in raw_rows]
-        new = [r for r in new if r is not None]
-        all_results.extend(new)
-        print(f"  fetched {len(all_results)}/{total}")
+        # Confirm we have a csrftoken cookie
+        cookies = context.cookies()
+        csrf_cookie = next((c["value"] for c in cookies if c["name"] == "csrftoken"), "")
+        print(f"csrftoken cookie present: {bool(csrf_cookie)}")
 
-        if not raw_rows or len(all_results) >= total:
-            break
+        # Paginate through results using in-browser fetch() calls
+        start = 0
+        total = None
 
-        start += _PAGE_SIZE
-        time.sleep(0.3)
+        while True:
+            js = _fetch_page_js(from_date, to_date, start)
+            result_str = page.evaluate(js)
+            result = json.loads(result_str)
+
+            status = result.get("status")
+            body_text = result.get("body", "")
+            print(f"  /search/report/data/ start={start} → HTTP {status}")
+
+            if status != 200:
+                print(f"  Unexpected status {status}. Body (first 500): {body_text[:500]}", file=sys.stderr)
+                sys.exit(1)
+
+            try:
+                data = json.loads(body_text)
+            except json.JSONDecodeError:
+                print(f"  Non-JSON response: {body_text[:500]}", file=sys.stderr)
+                sys.exit(1)
+
+            if total is None:
+                total = int(data.get("recordsFiltered", data.get("recordsTotal", 0)))
+                print(f"Total PTR filings in range: {total}")
+
+            raw_rows = data.get("data", [])
+            new = [_normalise(r) for r in raw_rows]
+            new = [r for r in new if r is not None]
+            all_results.extend(new)
+            print(f"  fetched {len(all_results)}/{total}")
+
+            if not raw_rows or len(all_results) >= total:
+                break
+
+            start += _PAGE_SIZE
+            time.sleep(0.3)
+
+        browser.close()
 
     return all_results
 
@@ -251,7 +192,6 @@ def main() -> None:
     to_date   = args.to_date   or today.isoformat()
 
     print(f"Fetching Senate PTR filings {from_date} → {to_date}")
-
     new_rows = fetch_range(from_date, to_date)
     print(f"Normalised {len(new_rows)} filings")
 
