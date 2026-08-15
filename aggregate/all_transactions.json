@@ -1,5 +1,44 @@
 [
   {
+    "senator": "Mark R Warner",
+    "disclosure_date": "08/14/2026",
+    "transaction_date": "07/07/2026",
+    "ticker": "--",
+    "asset_description": "Manassas VA GO Public Improvement Refunding Bonds\nRate/Coupon: 4.0%\nMatures: 2032-01-01",
+    "asset_type": "Municipal Security",
+    "type": "Purchase",
+    "amount": "$50,001 - $100,000",
+    "comment": "--",
+    "owner": "Self",
+    "ptr_link": "https://efdsearch.senate.gov/search/view/ptr/047c4167-e0a9-44d4-a2bf-5477eb6b20ab/"
+  },
+  {
+    "senator": "Mark R Warner",
+    "disclosure_date": "08/14/2026",
+    "transaction_date": "07/02/2026",
+    "ticker": "--",
+    "asset_description": "Alexandria VA GO Capital Improvement Bonds\nRate/Coupon: 5.0%\nMatures: 2031-12-15",
+    "asset_type": "Municipal Security",
+    "type": "Purchase",
+    "amount": "$50,001 - $100,000",
+    "comment": "--",
+    "owner": "Self",
+    "ptr_link": "https://efdsearch.senate.gov/search/view/ptr/047c4167-e0a9-44d4-a2bf-5477eb6b20ab/"
+  },
+  {
+    "senator": "Mark R Warner",
+    "disclosure_date": "08/14/2026",
+    "transaction_date": "07/02/2026",
+    "ticker": "--",
+    "asset_description": "Virginia Beach VA GO Public Improvement Bonds\nRate/Coupon: 5.0%\nMatures: 2031-02-01",
+    "asset_type": "Municipal Security",
+    "type": "Purchase",
+    "amount": "$100,001 - $250,000",
+    "comment": "--",
+    "owner": "Self",
+    "ptr_link": "https://efdsearch.senate.gov/search/view/ptr/047c4167-e0a9-44d4-a2bf-5477eb6b20ab/"
+  },
+  {
     "senator": "Angela D Alsobrooks",
     "disclosure_date": "08/13/2026",
     "transaction_date": "06/03/2025",
