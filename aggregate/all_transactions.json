@@ -1,5 +1,18 @@
 [
   {
+    "senator": "James Conley Justice, II",
+    "disclosure_date": "09/08/2026",
+    "transaction_date": "08/28/2025",
+    "ticker": "PEBO",
+    "asset_description": "Peoples Bancorp Inc. - Common Stock",
+    "asset_type": "",
+    "type": "Sale (Full)",
+    "amount": "$250,001 - $500,000",
+    "comment": "--",
+    "owner": "Self",
+    "ptr_link": "https://efdsearch.senate.gov/search/view/annual/5a069df5-928e-4ce3-b505-e0b2312823c8/"
+  },
+  {
     "senator": "Sheldon Whitehouse",
     "disclosure_date": "09/02/2026",
     "transaction_date": "08/06/2026",
