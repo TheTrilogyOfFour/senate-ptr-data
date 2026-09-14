@@ -1,5 +1,18 @@
 [
   {
+    "senator": "Angus S King, Jr.",
+    "disclosure_date": "09/14/2026",
+    "transaction_date": "08/05/2026",
+    "ticker": "--",
+    "asset_description": "EA - Electronic Arts Inc",
+    "asset_type": "Stock",
+    "type": "Sale (Full)",
+    "amount": "$15,001 - $50,000",
+    "comment": "--",
+    "owner": "Spouse",
+    "ptr_link": "https://efdsearch.senate.gov/search/view/ptr/e67c6e56-c81e-4e74-b960-849a460165e2/"
+  },
+  {
     "senator": "John Boozman",
     "disclosure_date": "09/11/2026",
     "transaction_date": "08/27/2026",
