@@ -1,5 +1,18 @@
 [
   {
+    "senator": "A. Mitchell McConnell, Jr.",
+    "disclosure_date": "09/21/2026",
+    "transaction_date": "09/01/2026",
+    "ticker": "WFC",
+    "asset_description": "Wells Fargo & Company Common Stock",
+    "asset_type": "Stock",
+    "type": "Purchase",
+    "amount": "$15,001 - $50,000",
+    "comment": "Dividend reinvestment",
+    "owner": "Spouse",
+    "ptr_link": "https://efdsearch.senate.gov/search/view/ptr/028aef33-dc0d-44a1-992f-aa35ee42685b/"
+  },
+  {
     "senator": "Alan Armstrong",
     "disclosure_date": "09/17/2026",
     "transaction_date": "08/20/2026",
